@@ -336,16 +336,6 @@ SSH (for debugging):
 ibmcloud is security-group-rule-add $OCP_SG_ID inbound tcp --port-min 22 --port-max 22 --remote 0.0.0.0/0
 ```
 
-HTTP/HTTPS ingress:
-
-```bash
-ibmcloud is security-group-rule-add $OCP_SG_ID inbound tcp --port-min 80 --port-max 80 --remote 0.0.0.0/0
-```
-
-```bash
-ibmcloud is security-group-rule-add $OCP_SG_ID inbound tcp --port-min 443 --port-max 443 --remote 0.0.0.0/0
-```
-
 Kubernetes API (external access):
 
 ```bash
@@ -398,10 +388,10 @@ ICMP (internal, for health checks):
 ibmcloud is security-group-rule-add $OCP_SG_ID inbound icmp --remote 10.240.0.0/24
 ```
 
-Kubernetes NodePort range (required for ingress router and services):
+Kubernetes NodePort range (CCM-created LB routes to NodePorts on masters):
 
 ```bash
-ibmcloud is security-group-rule-add $OCP_SG_ID inbound tcp --port-min 30000 --port-max 32767 --remote 0.0.0.0/0
+ibmcloud is security-group-rule-add $OCP_SG_ID inbound tcp --port-min 30000 --port-max 32767 --remote 10.240.0.0/24
 ```
 
 #### 6c. Add Outbound Rule (All Traffic)
@@ -416,7 +406,7 @@ ibmcloud is security-group-rule-add $OCP_SG_ID outbound all --remote 0.0.0.0/0
 ibmcloud is security-group-rules $OCP_SG_ID
 ```
 
-Should show ~14 rules (13 inbound + 1 outbound).
+Should show ~12 rules (11 inbound + 1 outbound).
 
 #### 6e. Fix VPE Gateway Security Group
 
@@ -889,15 +879,9 @@ echo "MASTER2_IP=$MASTER2_IP"
 
 Verify none are empty before proceeding.
 
-Wait for LB pools to be ready (pools may show update_pending after creation):
-
-```bash
-sleep 60
-```
-
 #### 12a. Add to API LB Pool (port 6443)
 
-> TARGET (IP address) is a positional argument. If you get `UPDATE_PENDING`, wait 15-30 seconds and retry.
+> The LB goes into `update_pending` after each member addition. Wait 60 seconds between each. If you get errors, wait longer and retry.
 
 ```bash
 sleep 60 && ibmcloud is load-balancer-pool-member-create $API_LB_ID $API_POOL_ID 6443 $BOOTSTRAP_IP
@@ -918,10 +902,6 @@ sleep 60 && ibmcloud is load-balancer-pool-member-create $API_LB_ID $API_POOL_ID
 #### 12b. Add to API-int LB Pool (port 6443)
 
 ```bash
-sleep 30
-```
-
-```bash
 sleep 60 && ibmcloud is load-balancer-pool-member-create $API_INT_LB_ID $API_INT_POOL_ID 6443 $BOOTSTRAP_IP
 ```
 
@@ -940,10 +920,6 @@ sleep 60 && ibmcloud is load-balancer-pool-member-create $API_INT_LB_ID $API_INT
 #### 12c. Add to MCS Pool (port 22623)
 
 ```bash
-sleep 30
-```
-
-```bash
 sleep 60 && ibmcloud is load-balancer-pool-member-create $API_INT_LB_ID $MCS_POOL_ID 22623 $BOOTSTRAP_IP
 ```
 
@@ -959,14 +935,15 @@ sleep 60 && ibmcloud is load-balancer-pool-member-create $API_INT_LB_ID $MCS_POO
 sleep 60 && ibmcloud is load-balancer-pool-member-create $API_INT_LB_ID $MCS_POOL_ID 22623 $MASTER2_IP
 ```
 
-> **Note**: If you get `UPDATE_PENDING` errors, wait 30-45 seconds and retry. The LB can only process one member addition at a time.
-
 #### 12d. Verify All Pool Members
 
+> Wait 60 seconds after the last add for the LB to finish processing.
+
 ```bash
-echo "API pool:" && ibmcloud is load-balancer-pool-members $API_LB_ID $API_POOL_ID --output json | jq '. | length'
-echo "API-int pool:" && ibmcloud is load-balancer-pool-members $API_INT_LB_ID $API_INT_POOL_ID --output json | jq '. | length'
-echo "MCS pool:" && ibmcloud is load-balancer-pool-members $API_INT_LB_ID $MCS_POOL_ID --output json | jq '. | length'
+sleep 60
+echo "API pool:     $(ibmcloud is load-balancer-pool-members $API_LB_ID $API_POOL_ID --output json | jq '. | length') members"
+echo "API-int pool: $(ibmcloud is load-balancer-pool-members $API_INT_LB_ID $API_INT_POOL_ID --output json | jq '. | length') members"
+echo "MCS pool:     $(ibmcloud is load-balancer-pool-members $API_INT_LB_ID $MCS_POOL_ID --output json | jq '. | length') members"
 ```
 
 Expected: API=4, API-int=4, MCS=4. (Ingress pool members are managed by CCM automatically — no manual action needed.)
