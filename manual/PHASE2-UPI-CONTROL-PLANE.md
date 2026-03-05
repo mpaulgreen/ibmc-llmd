@@ -418,6 +418,31 @@ ibmcloud is security-group-rules $OCP_SG_ID
 
 Should show ~14 rules (13 inbound + 1 outbound).
 
+#### 6e. Fix VPE Gateway Security Group
+
+> **Why?** IBM Cloud VPC has pre-existing VPE (Virtual Private Endpoint) gateways that provide private access to IBM Cloud services (VPC API, COS, Container Registry, etc.). These VPEs share a security group that ships with **ZERO inbound rules**, blocking all traffic. Without this fix, the cloud-controller-manager (CCM) cannot reach the VPC API (`eu-de.private.iaas.cloud.ibm.com`) to create load balancers.
+
+Find the VPE security group:
+
+```bash
+VPE_SG_ID=$(ibmcloud is endpoint-gateways --output json | jq -r '.[0].security_groups[0].id')
+echo "VPE Security Group: $VPE_SG_ID"
+```
+
+Verify it has no rules:
+
+```bash
+ibmcloud is security-group-rules $VPE_SG_ID
+```
+
+Add inbound HTTPS from the management subnet:
+
+```bash
+ibmcloud is security-group-rule-add $VPE_SG_ID inbound tcp --port-min 443 --port-max 443 --remote 10.240.0.0/24
+```
+
+> **Note**: All 5 VPE gateways (iks-riaas, iks-api, iks-cos, iks-cos-config, iks-registry) share this security group, so one rule covers all of them.
+
 ---
 
 ### Step 7: Import RHCOS Image
@@ -449,7 +474,7 @@ ibmcloud iam authorization-policy-create is cloud-object-storage Reader \
 ibmcloud cos bucket-create --bucket ocp-rhcos-image --region eu-de
 ```
 
-#### 7c. Upload RHCOS Image to COS
+#### 7c (cont). Upload RHCOS Image to COS
 
 The RHCOS image is cached locally from previous installer runs (~2.1GB):
 
@@ -462,15 +487,7 @@ ibmcloud cos upload --bucket ocp-rhcos-image \
 
 This takes 5-10 minutes.
 
-#### 7d. Grant VPC Access to COS
-
-```bash
-ibmcloud iam authorization-policy-create is cloud-object-storage Reader \
-  --source-resource-type image \
-  --target-service-instance-id $(ibmcloud resource service-instance ocp-cos --output json | jq -r '.[0].guid')
-```
-
-#### 7e. Import as VPC Custom Image
+#### 7d. Import as VPC Custom Image
 
 ```bash
 ibmcloud is image-create ocp-rhcos \
@@ -479,7 +496,7 @@ ibmcloud is image-create ocp-rhcos \
   --output json > /tmp/rhcos-image.json
 ```
 
-#### 7f. Wait for Image to Become Available
+#### 7e. Wait for Image to Become Available
 
 ```bash
 watch -n 15 'ibmcloud is image ocp-rhcos --output json | jq -r ".status"'
@@ -487,7 +504,7 @@ watch -n 15 'ibmcloud is image ocp-rhcos --output json | jq -r ".status"'
 
 Wait until status shows `available` (5-10 minutes). Press `Ctrl+C` when ready.
 
-#### 7g. Set Image ID
+#### 7f. Set Image ID
 
 ```bash
 export IMAGE_ID=$(ibmcloud is image ocp-rhcos --output json | jq -r '.id')
@@ -643,83 +660,15 @@ Verify the rules were added:
 ibmcloud is security-group-rules $LB_SG_ID
 ```
 
-Test API is reachable through the LB:
+#### 8g. Ingress Load Balancer — Created Automatically by CCM
 
-```bash
-curl -sk --connect-timeout 10 https://api.${CLUSTER_NAME}.${BASE_DOMAIN}:6443/version | head -5
-```
-
-Should return Kubernetes version JSON. If it times out, the SG rules didn't apply — wait 10 seconds and retry.
-
-#### 8g. Create Ingress Load Balancer
-
-> **Why?** The cloud-controller-manager cannot reach the IBM Cloud private VPC API endpoint to auto-create a LB for the ingress router. We must create it manually.
-
-```bash
-ibmcloud is load-balancer-create ocp-ingress-lb public \
-  --subnet $MGMT_SUBNET_ID \
-  --family application \
-  --output json > /tmp/ingress-lb.json
-export INGRESS_LB_ID=$(jq -r '.id' /tmp/ingress-lb.json)
-export INGRESS_LB_HOSTNAME=$(jq -r '.hostname' /tmp/ingress-lb.json)
-echo "Ingress LB ID: $INGRESS_LB_ID"
-echo "Ingress LB Hostname: $INGRESS_LB_HOSTNAME"
-```
-
-Wait for active:
-
-```bash
-echo "Waiting for ingress LB..."
-while true; do
-  STATUS=$(ibmcloud is load-balancer $INGRESS_LB_ID --output json | jq -r '.provisioning_status')
-  echo "Status: $STATUS"
-  if [ "$STATUS" = "active" ]; then break; fi
-  sleep 15
-done
-```
-
-Add SG rules for ingress LB (ports 80 and 443):
-
-```bash
-INGRESS_SG_ID=$(ibmcloud is load-balancer $INGRESS_LB_ID --output json | jq -r '.security_groups[0].id')
-ibmcloud is security-group-rule-add $INGRESS_SG_ID inbound tcp --port-min 80 --port-max 80 --remote 0.0.0.0/0
-ibmcloud is security-group-rule-add $INGRESS_SG_ID inbound tcp --port-min 443 --port-max 443 --remote 0.0.0.0/0
-```
-
-Create HTTP pool (port 80 → NodePort 31766):
-
-```bash
-ibmcloud is load-balancer-pool-create ocp-http-pool $INGRESS_LB_ID round_robin tcp 15 2 5 tcp \
-  --health-monitor-port 31766 \
-  --output json > /tmp/http-pool.json
-export HTTP_POOL_ID=$(jq -r '.id' /tmp/http-pool.json)
-sleep 20
-```
-
-Create HTTPS pool (port 443 → NodePort 32703, health check on 31766):
-
-> **Note**: HTTPS health check uses port 31766 (HTTP NodePort) because TCP health checks on the HTTPS NodePort (32703) return `unknown`.
-
-```bash
-ibmcloud is load-balancer-pool-create ocp-https-pool $INGRESS_LB_ID round_robin tcp 15 2 5 tcp \
-  --health-monitor-port 31766 \
-  --output json > /tmp/https-pool.json
-export HTTPS_POOL_ID=$(jq -r '.id' /tmp/https-pool.json)
-sleep 20
-```
-
-Create listeners:
-
-```bash
-ibmcloud is load-balancer-listener-create $INGRESS_LB_ID --port 80 --protocol tcp \
-  --default-pool $HTTP_POOL_ID --output json
-sleep 20
-ibmcloud is load-balancer-listener-create $INGRESS_LB_ID --port 443 --protocol tcp \
-  --default-pool $HTTPS_POOL_ID --output json
-sleep 20
-```
-
-> **Note**: Pool members for the ingress LB will be added in Step 12 along with the API pool members.
+> **No manual action needed.** The cloud-controller-manager (CCM) will automatically create the ingress load balancer when the IngressController is created during cluster installation. This works because:
+>
+> 1. Step 6e fixed the VPE security group, allowing CCM to reach the VPC API
+> 2. The default IngressController uses `LoadBalancerService` strategy
+> 3. CCM creates the VPC LB, pools, listeners, and backend members automatically
+>
+> The `*.apps` DNS record (Step 9e) will be created as a placeholder — update it after install-complete when you know the CCM-created LB hostname.
 
 ---
 
@@ -758,15 +707,11 @@ ibmcloud cis dns-record-create $CIS_DOMAIN_ID \
   --ttl 120
 ```
 
-#### 9e. Create Apps Wildcard DNS Record
+#### 9e. Apps Wildcard DNS — Created Later in Step 16b
 
-```bash
-ibmcloud cis dns-record-create $CIS_DOMAIN_ID \
-  --type CNAME \
-  --name "*.apps.${CLUSTER_NAME}" \
-  --content "$INGRESS_LB_HOSTNAME" \
-  --ttl 120
-```
+> **Do NOT create the `*.apps` record here.** The ingress LB hostname isn't known until CCM creates it during installation. Creating a placeholder pointing to the wrong backend causes silent routing failures. The `*.apps` record will be created in Step 16b after the CCM-created LB hostname is available.
+>
+> `wait-for bootstrap-complete` (Step 14) does NOT need `*.apps` DNS — it only needs `api` and `api-int`.
 
 #### 9f. Flush DNS and Verify
 
@@ -899,10 +844,55 @@ ibmcloud is instances --output json | jq -r '.[] | select(.name | startswith("oc
 
 ### Step 12: Add Instances to Load Balancer Pools
 
+#### 12-pre. Recover Environment Variables
+
+> **Why?** Steps 8 and 10-11 set variables with `export`, but these are lost if your terminal session resets. Run this block to re-derive all IDs from existing resources.
+
+```bash
+source ~/.ibmcloud-h100-env
+
+# Load Balancer IDs
+export API_LB_ID=$(ibmcloud is load-balancers --output json | jq -r '.[] | select(.name=="ocp-api-lb") | .id')
+export API_INT_LB_ID=$(ibmcloud is load-balancers --output json | jq -r '.[] | select(.name=="ocp-api-int-lb") | .id')
+
+# Pool IDs
+export API_POOL_ID=$(ibmcloud is load-balancer-pools $API_LB_ID --output json | jq -r '.[] | select(.name=="ocp-api-pool") | .id')
+export API_INT_POOL_ID=$(ibmcloud is load-balancer-pools $API_INT_LB_ID --output json | jq -r '.[] | select(.name=="ocp-api-int-pool") | .id')
+export MCS_POOL_ID=$(ibmcloud is load-balancer-pools $API_INT_LB_ID --output json | jq -r '.[] | select(.name=="ocp-mcs-pool") | .id')
+
+# LB Hostnames (for DNS in Step 9)
+export API_LB_HOSTNAME=$(ibmcloud is load-balancer $API_LB_ID --output json | jq -r '.hostname')
+export API_INT_LB_HOSTNAME=$(ibmcloud is load-balancer $API_INT_LB_ID --output json | jq -r '.hostname')
+
+# Security Group ID
+export OCP_SG_ID=$(ibmcloud is security-groups --output json | jq -r '.[] | select(.name=="ocp-h100-cluster-sg") | .id')
+
+# RHCOS Image ID
+export IMAGE_ID=$(ibmcloud is images --visibility private --output json | jq -r '.[] | select(.name=="ocp-rhcos") | .id')
+
+# Instance IPs
+export BOOTSTRAP_IP=$(ibmcloud is instances --output json | jq -r '.[] | select(.name=="ocp-bootstrap") | .primary_network_interface.primary_ip.address')
+export MASTER0_IP=$(ibmcloud is instances --output json | jq -r '.[] | select(.name=="ocp-master-0") | .primary_network_interface.primary_ip.address')
+export MASTER1_IP=$(ibmcloud is instances --output json | jq -r '.[] | select(.name=="ocp-master-1") | .primary_network_interface.primary_ip.address')
+export MASTER2_IP=$(ibmcloud is instances --output json | jq -r '.[] | select(.name=="ocp-master-2") | .primary_network_interface.primary_ip.address')
+
+echo "API_LB_ID=$API_LB_ID"
+echo "API_INT_LB_ID=$API_INT_LB_ID"
+echo "API_POOL_ID=$API_POOL_ID"
+echo "API_INT_POOL_ID=$API_INT_POOL_ID"
+echo "MCS_POOL_ID=$MCS_POOL_ID"
+echo "BOOTSTRAP_IP=$BOOTSTRAP_IP"
+echo "MASTER0_IP=$MASTER0_IP"
+echo "MASTER1_IP=$MASTER1_IP"
+echo "MASTER2_IP=$MASTER2_IP"
+```
+
+Verify none are empty before proceeding.
+
 Wait for LB pools to be ready (pools may show update_pending after creation):
 
 ```bash
-sleep 30
+sleep 60
 ```
 
 #### 12a. Add to API LB Pool (port 6443)
@@ -910,19 +900,19 @@ sleep 30
 > TARGET (IP address) is a positional argument. If you get `UPDATE_PENDING`, wait 15-30 seconds and retry.
 
 ```bash
-ibmcloud is load-balancer-pool-member-create $API_LB_ID $API_POOL_ID 6443 $BOOTSTRAP_IP
+sleep 60 && ibmcloud is load-balancer-pool-member-create $API_LB_ID $API_POOL_ID 6443 $BOOTSTRAP_IP
 ```
 
 ```bash
-ibmcloud is load-balancer-pool-member-create $API_LB_ID $API_POOL_ID 6443 $MASTER0_IP
+sleep 60 && ibmcloud is load-balancer-pool-member-create $API_LB_ID $API_POOL_ID 6443 $MASTER0_IP
 ```
 
 ```bash
-ibmcloud is load-balancer-pool-member-create $API_LB_ID $API_POOL_ID 6443 $MASTER1_IP
+sleep 60 && ibmcloud is load-balancer-pool-member-create $API_LB_ID $API_POOL_ID 6443 $MASTER1_IP
 ```
 
 ```bash
-ibmcloud is load-balancer-pool-member-create $API_LB_ID $API_POOL_ID 6443 $MASTER2_IP
+sleep 60 && ibmcloud is load-balancer-pool-member-create $API_LB_ID $API_POOL_ID 6443 $MASTER2_IP
 ```
 
 #### 12b. Add to API-int LB Pool (port 6443)
@@ -932,19 +922,19 @@ sleep 30
 ```
 
 ```bash
-ibmcloud is load-balancer-pool-member-create $API_INT_LB_ID $API_INT_POOL_ID 6443 $BOOTSTRAP_IP
+sleep 60 && ibmcloud is load-balancer-pool-member-create $API_INT_LB_ID $API_INT_POOL_ID 6443 $BOOTSTRAP_IP
 ```
 
 ```bash
-ibmcloud is load-balancer-pool-member-create $API_INT_LB_ID $API_INT_POOL_ID 6443 $MASTER0_IP
+sleep 60 && ibmcloud is load-balancer-pool-member-create $API_INT_LB_ID $API_INT_POOL_ID 6443 $MASTER0_IP
 ```
 
 ```bash
-ibmcloud is load-balancer-pool-member-create $API_INT_LB_ID $API_INT_POOL_ID 6443 $MASTER1_IP
+sleep 60 && ibmcloud is load-balancer-pool-member-create $API_INT_LB_ID $API_INT_POOL_ID 6443 $MASTER1_IP
 ```
 
 ```bash
-ibmcloud is load-balancer-pool-member-create $API_INT_LB_ID $API_INT_POOL_ID 6443 $MASTER2_IP
+sleep 60 && ibmcloud is load-balancer-pool-member-create $API_INT_LB_ID $API_INT_POOL_ID 6443 $MASTER2_IP
 ```
 
 #### 12c. Add to MCS Pool (port 22623)
@@ -954,68 +944,40 @@ sleep 30
 ```
 
 ```bash
-ibmcloud is load-balancer-pool-member-create $API_INT_LB_ID $MCS_POOL_ID 22623 $BOOTSTRAP_IP
+sleep 60 && ibmcloud is load-balancer-pool-member-create $API_INT_LB_ID $MCS_POOL_ID 22623 $BOOTSTRAP_IP
 ```
 
 ```bash
-ibmcloud is load-balancer-pool-member-create $API_INT_LB_ID $MCS_POOL_ID 22623 $MASTER0_IP
+sleep 60 && ibmcloud is load-balancer-pool-member-create $API_INT_LB_ID $MCS_POOL_ID 22623 $MASTER0_IP
 ```
 
 ```bash
-ibmcloud is load-balancer-pool-member-create $API_INT_LB_ID $MCS_POOL_ID 22623 $MASTER1_IP
+sleep 60 && ibmcloud is load-balancer-pool-member-create $API_INT_LB_ID $MCS_POOL_ID 22623 $MASTER1_IP
 ```
 
 ```bash
-ibmcloud is load-balancer-pool-member-create $API_INT_LB_ID $MCS_POOL_ID 22623 $MASTER2_IP
+sleep 60 && ibmcloud is load-balancer-pool-member-create $API_INT_LB_ID $MCS_POOL_ID 22623 $MASTER2_IP
 ```
 
 > **Note**: If you get `UPDATE_PENDING` errors, wait 30-45 seconds and retry. The LB can only process one member addition at a time.
 
-#### 12d. Add Masters to Ingress HTTP Pool (port 31766)
-
-> **Note**: Only add masters (not bootstrap) to ingress pools.
-
-```bash
-sleep 30
-```
-
-```bash
-ibmcloud is load-balancer-pool-member-create $INGRESS_LB_ID $HTTP_POOL_ID 31766 $MASTER0_IP
-```
-
-```bash
-sleep 30 && ibmcloud is load-balancer-pool-member-create $INGRESS_LB_ID $HTTP_POOL_ID 31766 $MASTER1_IP
-```
-
-```bash
-sleep 30 && ibmcloud is load-balancer-pool-member-create $INGRESS_LB_ID $HTTP_POOL_ID 31766 $MASTER2_IP
-```
-
-#### 12e. Add Masters to Ingress HTTPS Pool (port 32703)
-
-```bash
-sleep 30 && ibmcloud is load-balancer-pool-member-create $INGRESS_LB_ID $HTTPS_POOL_ID 32703 $MASTER0_IP
-```
-
-```bash
-sleep 30 && ibmcloud is load-balancer-pool-member-create $INGRESS_LB_ID $HTTPS_POOL_ID 32703 $MASTER1_IP
-```
-
-```bash
-sleep 30 && ibmcloud is load-balancer-pool-member-create $INGRESS_LB_ID $HTTPS_POOL_ID 32703 $MASTER2_IP
-```
-
-#### 12f. Verify All Pool Members
+#### 12d. Verify All Pool Members
 
 ```bash
 echo "API pool:" && ibmcloud is load-balancer-pool-members $API_LB_ID $API_POOL_ID --output json | jq '. | length'
 echo "API-int pool:" && ibmcloud is load-balancer-pool-members $API_INT_LB_ID $API_INT_POOL_ID --output json | jq '. | length'
 echo "MCS pool:" && ibmcloud is load-balancer-pool-members $API_INT_LB_ID $MCS_POOL_ID --output json | jq '. | length'
-echo "HTTP pool:" && ibmcloud is load-balancer-pool-members $INGRESS_LB_ID $HTTP_POOL_ID --output json | jq '. | length'
-echo "HTTPS pool:" && ibmcloud is load-balancer-pool-members $INGRESS_LB_ID $HTTPS_POOL_ID --output json | jq '. | length'
 ```
 
-Expected: API=4, API-int=4, MCS=4, HTTP=3, HTTPS=3.
+Expected: API=4, API-int=4, MCS=4. (Ingress pool members are managed by CCM automatically — no manual action needed.)
+
+#### 12e. Test API Reachability Through LB
+
+```bash
+curl -sk --connect-timeout 10 https://api.${CLUSTER_NAME}.${BASE_DOMAIN}:6443/version | head -5
+```
+
+Should return Kubernetes version JSON (or connection refused if instances haven't fully booted yet). If it times out, the LB SG rules from Step 8f didn't apply — check `ibmcloud is security-group-rules $LB_SG_ID`.
 
 ---
 
@@ -1023,13 +985,15 @@ Expected: API=4, API-int=4, MCS=4, HTTP=3, HTTPS=3.
 
 ### Step 13: Start DNS Flush Loop
 
+> **Why?** macOS aggressively caches DNS negative results. If `api.ocp-h100-cluster.ibmc...` was queried before the CIS records propagated, macOS caches the NXDOMAIN and `openshift-install` (which uses the system resolver) will fail with `no such host`. This flush loop clears that negative cache every 30 seconds.
+
 In a **second terminal**:
 
 ```bash
 sudo echo "sudo cached" && while true; do sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder && echo "$(date): DNS cache flushed"; sleep 30; done
 ```
 
-Keep this running throughout the bootstrap and installation.
+> **When to stop**: Kill this loop (`Ctrl+C`) after `wait-for install-complete` succeeds (Step 17). It's only needed while `openshift-install` is running on your Mac.
 
 ---
 
@@ -1124,30 +1088,89 @@ ibmcloud resource service-key-delete ocp-cos-hmac --force
 
 ## Phase E: Complete Installation
 
-### Step 16: Patch Ingress Router and Create Credential Secrets
+### Step 16: Configure DNS Forwarder and Create Credential Secrets
 
-> **Why?** The cloud-controller-manager cannot reach the IBM Cloud private VPC API endpoint (`eu-de.private.iaas.cloud.ibm.com`) to auto-create a load balancer for the ingress router. We patch the router service to NodePort — our manual ingress LB (created in Step 8g) already routes to the NodePorts.
+> **Why?** The VPC internal DNS resolver (`161.26.0.x`) cannot resolve CIS-managed domains (returns NXDOMAIN). OpenShift pods use CoreDNS, which forwards to the VPC DNS resolver by default. We add a DNS forwarder so CoreDNS forwards our domain to Google DNS (which can resolve CIS records).
 
-#### 16a. Patch Router Service to NodePort
+#### 16a. Add DNS Forwarder for CIS Domain
 
 ```bash
 export KUBECONFIG=$HOME/ocp-h100-upi-install/auth/kubeconfig
 ```
 
 ```bash
-oc patch service router-default -n openshift-ingress \
-  -p '{"spec":{"type":"NodePort"}}'
+oc patch dns.operator default --type merge -p '{
+  "spec": {
+    "servers": [
+      {
+        "name": "apps-dns-forwarder",
+        "zones": ["ibmc.kni.syseng.devcluster.openshift.com"],
+        "forwardPlugin": {
+          "upstreams": ["8.8.8.8", "8.8.4.4"],
+          "policy": "Random"
+        }
+      }
+    ]
+  }
+}'
 ```
 
-Verify:
+Wait for CoreDNS to pick up the new config (auto-reloads within ~30 seconds):
 
 ```bash
-oc get service -n openshift-ingress router-default
+sleep 30
+oc get configmap dns-default -n openshift-dns -o jsonpath='{.data.Corefile}' | head -10
 ```
 
-Should show `TYPE: NodePort`.
+Should show `ibmc.kni.syseng.devcluster.openshift.com:5353` with `forward . 8.8.8.8 8.8.4.4`. If not, wait and check again — the dns-operator reconciles the Corefile from the `dns.operator` CR.
 
-#### 16b. Create Credential Secrets (if not embedded in ignition)
+#### 16b. Wait for CCM-Created Ingress LB
+
+The CCM creates the ingress VPC load balancer automatically when the IngressController starts. This takes ~5 minutes. Poll until the hostname appears:
+
+```bash
+echo "Waiting for CCM to create ingress LB..."
+while true; do
+  INGRESS_LB_HOSTNAME=$(oc get svc -n openshift-ingress router-default -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+  if [ -n "$INGRESS_LB_HOSTNAME" ]; then
+    echo "CCM-created LB: $INGRESS_LB_HOSTNAME"
+    break
+  fi
+  echo "$(date +%H:%M:%S) - Still pending..."
+  sleep 30
+done
+```
+
+> **If this hangs for >10 minutes**: Check CCM logs with `oc logs -n openshift-cloud-controller-manager -l app=ibm-cloud-controller-manager --tail=20`. If you see `i/o timeout` to `10.240.0.8:443`, the VPE SG fix (Step 6e) wasn't applied correctly.
+
+#### 16c. Create *.apps DNS Record
+
+```bash
+ibmcloud cis instance-set ocp-cis
+export CIS_DOMAIN_ID=$(ibmcloud cis domains --output json | jq -r '.[0].id')
+
+# Create or update — handles both fresh deploy and re-runs
+APPS_RECORD_ID=$(ibmcloud cis dns-records $CIS_DOMAIN_ID -i ocp-cis --output json | jq -r '.[] | select(.name | contains("*.apps")) | .id')
+if [ -n "$APPS_RECORD_ID" ]; then
+  echo "Updating existing *.apps record..."
+  ibmcloud cis dns-record-update $CIS_DOMAIN_ID $APPS_RECORD_ID -i ocp-cis \
+    --type CNAME --name "*.apps.${CLUSTER_NAME}" --content "$INGRESS_LB_HOSTNAME" --ttl 120
+else
+  echo "Creating *.apps record..."
+  ibmcloud cis dns-record-create $CIS_DOMAIN_ID \
+    --type CNAME --name "*.apps.${CLUSTER_NAME}" --content "$INGRESS_LB_HOSTNAME" --ttl 120
+fi
+```
+
+Verify resolution (from your Mac):
+
+```bash
+dig +short console-openshift-console.apps.${CLUSTER_NAME}.${BASE_DOMAIN}
+```
+
+Should return the LB hostname and its IPs.
+
+#### 16d. Create Credential Secrets (if not embedded in ignition)
 
 > **Note**: If you followed Step 4 correctly (manifests → secrets → ignition), these secrets are already embedded. If they're missing, create them now:
 
@@ -1189,7 +1212,7 @@ INFO Login to the console with user: "kubeadmin", and password: "xxxxx-xxxxx-xxx
 
 ### Step 18: Verify and Save
 
-#### 17a. Check Nodes
+#### 18a. Check Nodes
 
 ```bash
 oc get nodes
@@ -1203,7 +1226,7 @@ ocp-master-1  Ready    control-plane,master   Xm    v1.x.x
 ocp-master-2  Ready    control-plane,master   Xm    v1.x.x
 ```
 
-#### 17b. Check Cluster Operators
+#### 18b. Check Cluster Operators
 
 ```bash
 oc get co
@@ -1211,13 +1234,13 @@ oc get co
 
 All should show `AVAILABLE=True`, `PROGRESSING=False`, `DEGRADED=False`.
 
-#### 17c. Get Cluster Version
+#### 18c. Get Cluster Version
 
 ```bash
 oc get clusterversion
 ```
 
-#### 17d. Get Access Information
+#### 18d. Get Access Information
 
 ```bash
 echo "API URL: $(oc whoami --show-server)"
@@ -1225,32 +1248,20 @@ echo "Console URL: $(oc whoami --show-console)"
 echo "kubeadmin password: $(cat ~/ocp-h100-upi-install/auth/kubeadmin-password)"
 ```
 
-#### 17e. Create Apps Wildcard DNS Record
+#### 18e. Verify Apps DNS and Console Access
 
 ```bash
-ibmcloud cis instance-set ocp-cis
-export CIS_DOMAIN_ID=$(ibmcloud cis domains --output json | jq -r '.[0].id')
+echo "DNS resolution:"
+dig +short console-openshift-console.apps.${CLUSTER_NAME}.${BASE_DOMAIN}
+
+echo ""
+echo "Console HTTP status:"
+curl -sk -o /dev/null -w "%{http_code}" https://console-openshift-console.apps.${CLUSTER_NAME}.${BASE_DOMAIN}
 ```
 
-Get the ingress router's canonical hostname (once the ingress operator is running):
+DNS should return the CCM-created LB IPs. Console should return HTTP `200`.
 
-```bash
-export INGRESS_HOSTNAME=$(oc get service -n openshift-ingress router-default -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
-
-if [ -n "$INGRESS_HOSTNAME" ]; then
-  ibmcloud cis dns-record-create $CIS_DOMAIN_ID \
-    --type CNAME \
-    --name "*.apps.${CLUSTER_NAME}" \
-    --content "$INGRESS_HOSTNAME" \
-    --ttl 120
-  echo "Apps wildcard DNS created"
-else
-  echo "Ingress not ready yet. Create *.apps DNS manually later."
-  echo "Point *.apps.${CLUSTER_NAME}.${BASE_DOMAIN} to the ingress router LB hostname"
-fi
-```
-
-#### 17f. Save Cluster Info
+#### 18f. Save Cluster Info
 
 ```bash
 cat > ~/ocp-h100-upi-install/cluster-info.txt << EOF
@@ -1381,10 +1392,11 @@ sleep 60
 # Delete floating IPs
 ibmcloud is floating-ip-release ocp-bootstrap-fip --force 2>/dev/null
 
-# Delete load balancers
+# Delete load balancers (CCM-created ingress LB is auto-named, list first)
 ibmcloud is load-balancer-delete ocp-api-lb --force
 ibmcloud is load-balancer-delete ocp-api-int-lb --force
-ibmcloud is load-balancer-delete ocp-ingress-lb --force
+# CCM-created ingress LB: find and delete by listing
+ibmcloud is load-balancers --output json | jq -r '.[] | select(.name | startswith("kube-")) | .name' | xargs -I{} ibmcloud is load-balancer-delete {} --force 2>/dev/null
 
 # Wait for LB deletion
 sleep 120
