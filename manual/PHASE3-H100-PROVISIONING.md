@@ -199,17 +199,11 @@ Use the RHCOS custom image imported during Phase 2 (Step 7). The instance boots 
 
 ```bash
 export IMAGE_ID=$(ibmcloud is images --visibility private --output json | jq -r '.[] | select(.name=="ocp-rhcos") | .id')
-echo "RHCOS Image ID: $IMAGE_ID"
-```
-
-If empty, you need to import RHCOS first — see Phase 2 Step 7.
-
-#### Verify Image
-
-```bash
 export IMAGE_NAME=$(ibmcloud is image $IMAGE_ID --output json | jq -r '.name')
 echo "Using image: $IMAGE_NAME ($IMAGE_ID)"
 ```
+
+If empty, you need to import RHCOS first — see Phase 2 Step 7.
 
 ---
 
