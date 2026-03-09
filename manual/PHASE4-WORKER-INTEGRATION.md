@@ -343,7 +343,7 @@ oc describe node $H100_NODE_NAME | grep -A 10 "Capacity:"
 - `cpu:` 160 (160 vCPUs)
 - `memory:` ~1.75Ti
 
-> GPU resources (`nvidia.com/gpu: 8`) will NOT appear until GPU Operator is installed (Phase 6).
+> GPU resources (`nvidia.com/gpu: 8`) will NOT appear until GPU Operator is installed (Phase 5).
 
 #### 11c. Cluster Operators Healthy
 
@@ -376,8 +376,8 @@ echo "Roles:  $(oc get node $H100_NODE_NAME -o jsonpath='{.metadata.labels.node-
 echo "CPU:    $(oc get node $H100_NODE_NAME -o jsonpath='{.status.capacity.cpu}')"
 echo "Memory: $(oc get node $H100_NODE_NAME -o jsonpath='{.status.capacity.memory}')"
 echo ""
-echo "GPU resources: Not yet (Phase 6 — GPU Operator)"
-echo "RDMA networks: Not yet (Phase 5 — RDMA Operators)"
+echo "GPU resources: Not yet (Phase 5 — GPU Operator)"
+echo "RDMA networks: Not yet (Phase 5 — RDMA Operators, optional)"
 echo "========================================"
 ```
 
@@ -406,10 +406,70 @@ After Phase 4:
 - **Worker**: 1 H100 (gx3d-160x1792x8h100) — ~$30-40/hour
 - **Total**: ~$30-41/hour
 
-To stop H100 costs temporarily (loses cluster network — must re-attach on restart):
+---
+
+## Operations: Stop/Start H100
+
+The H100 costs ~$30-40/hour. Stop it when not in use to save costs. The node auto-rejoins OpenShift on restart — no manual intervention needed.
+
+### Stop H100 (Save Costs)
 
 ```bash
 ibmcloud is instance-stop $H100_INSTANCE_ID --force
+```
+
+What happens:
+- Node shows `NotReady` in `oc get nodes` within ~1 minute
+- Cluster network attachments **persist** (not detached on stop)
+- Kubelet certificates **persist** on disk
+- Pods on the node are evicted after 5 minutes (default `pod-eviction-timeout`)
+
+### Start H100
+
+```bash
+ibmcloud is instance-start $H100_INSTANCE_ID
+```
+
+What happens:
+- RDMA fabric reinitializes (takes 10-15 minutes)
+- Kubelet starts and reconnects using existing certificates
+- **No CSR approval needed** — the node is already known to the cluster
+- Node returns to `Ready` automatically
+
+### Verify After Restart
+
+Wait 10-15 minutes after start, then:
+
+```bash
+oc get nodes
+```
+
+Should show 4 nodes, all Ready.
+
+```bash
+oc get pods -A -o wide | grep ocp-gpu-worker-h100 | grep -v Running
+```
+
+Should return nothing (all pods Running).
+
+```bash
+ibmcloud is instance-cluster-network-attachments $H100_INSTANCE_ID --output json | jq '. | length'
+```
+
+Should show `8` (all cluster network attachments intact).
+
+### If Node Doesn't Rejoin After Restart
+
+If the instance was stopped for an extended period, kubelet certificates may have expired. Check for pending CSRs:
+
+```bash
+oc get csr | grep Pending
+```
+
+If pending CSRs exist, approve them:
+
+```bash
+oc get csr --no-headers | grep Pending | awk '{print $1}' | xargs oc adm certificate approve
 ```
 
 ---
@@ -466,12 +526,10 @@ oc get csr --no-headers | grep Pending | awk '{print $1}' | xargs oc adm certifi
 
 After Phase 4 completes:
 
-1. **Phase 5**: Install RDMA Operators (NFD, NMState, SR-IOV, NVIDIA Network)
-2. **Phase 6**: Install GPU Operator (NVIDIA GPU Operator, ClusterPolicy)
-3. **Phase 7**: Validate (RDMA test, GPU test, optional NCCL benchmark)
+1. **Phase 5**: Install Operators — GPU stack (NFD, GPU Operator), AI platform (cert-manager, RHCL, LWS, RHOAI), model serving (DataScienceCluster + KServe). See `PHASE5-OPERATORS.md`.
 
 ---
 
 **Phase 4 Complete!**
 
-**H100 joined as OpenShift worker node. 4 nodes total (3 masters + 1 H100). Ready for operator installation.**
+**H100 joined as OpenShift worker node. 4 nodes total (3 masters + 1 H100). Proceed to Phase 5 (PHASE5-OPERATORS.md) for operator installation.**
