@@ -376,13 +376,13 @@ export BOOTSTRAP_IGN_URL=$(AWS_ACCESS_KEY_ID=$COS_ACCESS_KEY AWS_SECRET_ACCESS_K
 echo "Bootstrap IGN URL: $BOOTSTRAP_IGN_URL"
 ```
 
-Test the URL is accessible:
+Test the URL is accessible (must use GET, not HEAD — presigned URLs are signed for GET only):
 
 ```bash
-curl -sI "$BOOTSTRAP_IGN_URL" | head -3
+curl -so /dev/null -w "%{http_code}" "$BOOTSTRAP_IGN_URL"
 ```
 
-Should show `HTTP/1.1 200 OK`.
+Should show `200`. (A `curl -sI` HEAD request will return 403 — this is expected since the presigned signature only covers GET.)
 
 > **Note**: The presigned URL expires in 4 hours. If you need to restart the process, regenerate it with the same command.
 
@@ -520,31 +520,6 @@ ibmcloud is security-group-rules $OCP_SG_ID
 ```
 
 Should show ~12 rules (11 inbound + 1 outbound).
-
-#### 6e. Fix VPE Gateway Security Group
-
-> **Why?** IBM Cloud VPC has pre-existing VPE (Virtual Private Endpoint) gateways that provide private access to IBM Cloud services (VPC API, COS, Container Registry, etc.). These VPEs share a security group that ships with **ZERO inbound rules**, blocking all traffic. Without this fix, the cloud-controller-manager (CCM) cannot reach the VPC API (`eu-de.private.iaas.cloud.ibm.com`) to create load balancers.
-
-Find the VPE security group:
-
-```bash
-VPE_SG_ID=$(ibmcloud is endpoint-gateways --output json | jq -r '.[0].security_groups[0].id')
-echo "VPE Security Group: $VPE_SG_ID"
-```
-
-Verify it has no rules:
-
-```bash
-ibmcloud is security-group-rules $VPE_SG_ID
-```
-
-Add inbound HTTPS from the management subnet:
-
-```bash
-ibmcloud is security-group-rule-add $VPE_SG_ID inbound tcp --port-min 443 --port-max 443 --remote 10.240.0.0/24
-```
-
-> **Note**: All 5 VPE gateways (iks-riaas, iks-api, iks-cos, iks-cos-config, iks-registry) share this security group, so one rule covers all of them.
 
 ---
 
@@ -767,7 +742,7 @@ ibmcloud is security-group-rules $LB_SG_ID
 
 > **No manual action needed.** The cloud-controller-manager (CCM) will automatically create the ingress load balancer when the IngressController is created during cluster installation. This works because:
 >
-> 1. Step 6e fixed the VPE security group, allowing CCM to reach the VPC API
+> 1. The public gateway allows CCM to reach the VPC API via public endpoints
 > 2. The default IngressController uses `LoadBalancerService` strategy
 > 3. CCM creates the VPC LB, pools, listeners, and backend members automatically
 >
@@ -1227,7 +1202,7 @@ while true; do
 done
 ```
 
-> **If this hangs for >10 minutes**: Check CCM logs with `oc logs -n openshift-cloud-controller-manager -l app=ibm-cloud-controller-manager --tail=20`. If you see `i/o timeout` to `10.240.0.8:443`, the VPE SG fix (Step 6e) wasn't applied correctly.
+> **If this hangs for >10 minutes**: Check CCM logs with `oc get pods -n openshift-cloud-controller-manager -o name | head -1 | xargs -I{} oc logs -n openshift-cloud-controller-manager {} --tail=20`. If you see `i/o timeout`, verify the public gateway is attached to the subnet (`ibmcloud is subnet $MGMT_SUBNET_ID --output json | jq -r '.public_gateway.name'`).
 
 #### 16c. Create *.apps DNS Record
 
@@ -1520,7 +1495,7 @@ ibmcloud is floating-ip-release ocp-bootstrap-fip --force 2>/dev/null
 ### Teardown Step 4: Delete Security Groups, Image, DNS, COS
 
 ```bash
-# Delete security groups (except VPE and default)
+# Delete security groups (except default)
 ibmcloud is security-group-delete ocp-h100-cluster-sg --force
 # Auto-created LB SGs
 ibmcloud is security-groups --output json | jq -r '.[] | select(.name | contains("kube-api-lb") or contains("sg-kube")) | .id' | xargs -I{} ibmcloud is security-group-delete {} --force 2>/dev/null
@@ -1546,11 +1521,6 @@ rm -rf ~/ocp-h100-upi-install
 ### Teardown Step 5: Delete VPC Resources (Phase 0)
 
 ```bash
-# Delete VPE gateways (auto-created by IBM Cloud, block subnet deletion)
-for vpe in $(ibmcloud is endpoint-gateways --output json | jq -r '.[].id'); do
-  ibmcloud is endpoint-gateway-delete $vpe --force
-done
-
 # Detach public gateway from subnet
 echo "y" | ibmcloud is subnet-public-gateway-detach $MGMT_SUBNET_ID
 
