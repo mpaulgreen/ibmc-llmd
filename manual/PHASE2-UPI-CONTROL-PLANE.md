@@ -5,6 +5,7 @@
 This phase deploys a 3-node OpenShift control plane on IBM Cloud VPC using the **User-Provisioned Infrastructure (UPI)** method. Unlike IPI (which has a CAPI bug preventing deployment), UPI creates all infrastructure manually — giving full control over instance creation and configuration.
 
 **What You'll Accomplish:**
+- Create VPC, subnet, and public gateway from scratch
 - Generate OpenShift ignition configs
 - Upload bootstrap ignition to Cloud Object Storage
 - Create security groups, load balancers, and DNS records
@@ -22,13 +23,119 @@ Before starting, ensure Phase 1 is complete:
 
 - [ ] Environment file exists: `~/.ibmcloud-h100-env`
 - [ ] IBM Cloud CLI logged in to eu-de region
-- [ ] openshift-install 4.19.24 installed
-- [ ] oc 4.19.24 installed
+- [ ] openshift-install 4.19+ installed
+- [ ] oc 4.19+ installed
 - [ ] Pull secret at `~/.pull-secret.json`
 - [ ] SSH public key at `~/.ssh/id_rsa.pub`
 - [ ] CIS domain `ibmc.kni.syseng.devcluster.openshift.com` active
-- [ ] Public gateway `ocp-pgw` attached to subnet
 - [ ] COS instance `ocp-cos` exists
+- [ ] SSH key `my-h100-key-eude` exists in IBM Cloud (`r010-3f6ad86f-...`)
+
+---
+
+## Phase 0: Create VPC Infrastructure
+
+### Step 0: Create VPC, Subnet, and Public Gateway
+
+This step creates the VPC networking infrastructure from scratch. After this step, VPC_ID and MGMT_SUBNET_ID will be saved to your env file.
+
+#### 0a. Load Environment and Login
+
+```bash
+source ~/.ibmcloud-h100-env
+```
+
+```bash
+ibmcloud_login
+```
+
+#### 0b. Check for Existing VPC
+
+```bash
+ibmcloud is vpcs --output json | jq -r '.[] | select(.name == "rdma-pvc-eude") | .name, .id'
+```
+
+**If a VPC is shown** — set `export VPC_ID=<id>`, recover the subnet ID with `export MGMT_SUBNET_ID=$(ibmcloud is subnets --output json | jq -r '.[] | select(.name=="ocp-mgmt-subnet") | .id')`, save both to env file with `sed`, and skip to 0g.
+
+**If empty** — no VPC exists. Proceed to 0c.
+
+#### 0c. Create VPC
+
+```bash
+ibmcloud is vpc-create rdma-pvc-eude \
+  --address-prefix-management manual \
+  --output json > /tmp/vpc-create.json
+```
+
+```bash
+export VPC_ID=$(jq -r '.id' /tmp/vpc-create.json)
+echo "VPC ID: $VPC_ID"
+```
+
+Save to env file:
+
+```bash
+sed -i '' "s/^export VPC_ID=.*/export VPC_ID=$VPC_ID/" ~/.ibmcloud-h100-env
+```
+
+#### 0d. Create Address Prefix
+
+```bash
+ibmcloud is vpc-address-prefix-create mgmt-prefix $VPC_ID eu-de-2 10.240.0.0/16 \
+  --output json > /tmp/addr-prefix.json
+echo "Address Prefix: $(jq -r '.id' /tmp/addr-prefix.json)"
+```
+
+#### 0e. Create Management Subnet
+
+```bash
+ibmcloud is subnet-create ocp-mgmt-subnet $VPC_ID \
+  --zone eu-de-2 \
+  --ipv4-cidr-block 10.240.0.0/24 \
+  --output json > /tmp/mgmt-subnet.json
+```
+
+```bash
+export MGMT_SUBNET_ID=$(jq -r '.id' /tmp/mgmt-subnet.json)
+echo "Subnet ID: $MGMT_SUBNET_ID"
+```
+
+Save to env file:
+
+```bash
+sed -i '' "s/^export MGMT_SUBNET_ID=.*/export MGMT_SUBNET_ID=$MGMT_SUBNET_ID/" ~/.ibmcloud-h100-env
+```
+
+#### 0f. Create and Attach Public Gateway
+
+```bash
+ibmcloud is public-gateway-create ocp-pgw $VPC_ID eu-de-2 \
+  --output json > /tmp/pgw.json
+export PGW_ID=$(jq -r '.id' /tmp/pgw.json)
+echo "Public Gateway ID: $PGW_ID"
+```
+
+Attach to subnet:
+
+```bash
+ibmcloud is subnet-update $MGMT_SUBNET_ID --pgw $PGW_ID --output json | jq '{name, public_gateway: .public_gateway.name}'
+```
+
+#### 0g. Verify VPC Setup
+
+```bash
+echo "VPC:     $(ibmcloud is vpc $VPC_ID --output json | jq -r '.name') ($VPC_ID)"
+echo "Subnet:  $(ibmcloud is subnet $MGMT_SUBNET_ID --output json | jq -r '.name + " " + .ipv4_cidr_block')"
+echo "Gateway: $(ibmcloud is subnet $MGMT_SUBNET_ID --output json | jq -r '.public_gateway.name // "NONE"')"
+```
+
+**Expected**: VPC `rdma-pvc-eude`, subnet `ocp-mgmt-subnet 10.240.0.0/24`, gateway `ocp-pgw`.
+
+Reload env file with the new IDs:
+
+```bash
+source ~/.ibmcloud-h100-env
+```
 
 ---
 
@@ -326,6 +433,12 @@ Should be ~200-300 bytes.
 ibmcloud is security-group-create ocp-h100-cluster-sg $VPC_ID --output json > /tmp/ocp-sg.json
 export OCP_SG_ID=$(jq -r '.id' /tmp/ocp-sg.json)
 echo "Security Group ID: $OCP_SG_ID"
+```
+
+Save to environment file (Phase 3 needs this):
+
+```bash
+sed -i '' "s/^export OCP_SG_ID=.*/export OCP_SG_ID=$OCP_SG_ID/" ~/.ibmcloud-h100-env
 ```
 
 #### 6b. Add Inbound Rules
@@ -721,11 +834,7 @@ dig api-int.${CLUSTER_NAME}.${BASE_DOMAIN} +short
 
 Should resolve to the API-int LB hostname/IPs.
 
-```bash
-dig console-openshift-console.apps.${CLUSTER_NAME}.${BASE_DOMAIN} +short
-```
-
-Should resolve to the Ingress LB hostname/IPs.
+> **Note**: Do NOT test `*.apps` DNS here — the `*.apps` record hasn't been created yet (that happens in Step 16c after the CCM creates the ingress LB).
 
 ---
 
@@ -1286,6 +1395,8 @@ Stop the DNS flush loop in the second terminal (Ctrl+C).
 
 At the end of Phase 2 (UPI), you should have:
 
+- [x] **VPC created** (`rdma-pvc-eude`) with subnet, public gateway, and address prefix
+- [x] **VPC_ID and MGMT_SUBNET_ID** saved to `~/.ibmcloud-h100-env`
 - [x] **3 master nodes** in Ready state
 - [x] **All cluster operators** Available
 - [x] **API and API-int load balancers** active
@@ -1354,7 +1465,43 @@ oc describe co <operator-name>
 
 ## Clean Up (If Deployment Fails)
 
-To start over, delete all UPI resources:
+To start over, delete all resources. **Order matters** — load balancers must be fully deprovisioned before subnet/VPC deletion.
+
+### Teardown Step 1: Delete ALL Load Balancers FIRST
+
+> **CRITICAL**: Delete load balancers before instances. The CCM creates LBs that may not match obvious name patterns (`ocp-*`, `kube-*`). Delete ALL LBs unconditionally, then wait for their reserved IPs to be cleaned up before proceeding.
+
+```bash
+# List ALL load balancers
+ibmcloud is load-balancers --output json | jq -r '.[] | "\(.name) | \(.id)"'
+```
+
+```bash
+# Delete ALL load balancers unconditionally
+for LB_ID in $(ibmcloud is load-balancers --output json | jq -r '.[].id'); do
+  echo -n "Deleting $LB_ID... "
+  ibmcloud is load-balancer-delete $LB_ID --force
+done
+```
+
+### Teardown Step 2: Wait for LB Reserved IPs to Clear
+
+> **Why wait here?** Deleted LBs leave orphaned reserved IPs on the subnet. Until IBM Cloud's backend cleans them up, the subnet cannot be deleted. This takes 5-30 minutes.
+
+```bash
+echo "Waiting for LB reserved IPs to clear..."
+while true; do
+  GHOST_COUNT=$(ibmcloud is subnet-reserved-ips $MGMT_SUBNET_ID --output json | jq '[.[] | select(.target.resource_type == "load_balancer")] | length')
+  if [ "$GHOST_COUNT" = "0" ]; then
+    echo "All LB reserved IPs cleared"
+    break
+  fi
+  echo "$(date +%H:%M:%S) - $GHOST_COUNT ghost LB reserved IPs remaining, waiting..."
+  sleep 120
+done
+```
+
+### Teardown Step 3: Delete Instances and Floating IPs
 
 ```bash
 # Delete instances
@@ -1363,23 +1510,23 @@ ibmcloud is instance-delete ocp-master-0 --force
 ibmcloud is instance-delete ocp-master-1 --force
 ibmcloud is instance-delete ocp-master-2 --force
 
-# Wait for deletion
+# Wait for instance deletion
 sleep 60
 
 # Delete floating IPs
 ibmcloud is floating-ip-release ocp-bootstrap-fip --force 2>/dev/null
+```
 
-# Delete load balancers (CCM-created ingress LB is auto-named, list first)
-ibmcloud is load-balancer-delete ocp-api-lb --force
-ibmcloud is load-balancer-delete ocp-api-int-lb --force
-# CCM-created ingress LB: find and delete by listing
-ibmcloud is load-balancers --output json | jq -r '.[] | select(.name | startswith("kube-")) | .name' | xargs -I{} ibmcloud is load-balancer-delete {} --force 2>/dev/null
+### Teardown Step 4: Delete Security Groups, Image, DNS, COS
 
-# Wait for LB deletion
-sleep 120
-
-# Delete security group (may need to wait for LBs to fully delete)
+```bash
+# Delete security groups (except VPE and default)
 ibmcloud is security-group-delete ocp-h100-cluster-sg --force
+# Auto-created LB SGs
+ibmcloud is security-groups --output json | jq -r '.[] | select(.name | contains("kube-api-lb") or contains("sg-kube")) | .id' | xargs -I{} ibmcloud is security-group-delete {} --force 2>/dev/null
+
+# Delete custom image
+ibmcloud is image-delete ocp-rhcos --force 2>/dev/null
 
 # Delete DNS records
 ibmcloud cis instance-set ocp-cis
@@ -1390,9 +1537,45 @@ done
 
 # Clean COS
 ibmcloud cos object-delete --bucket ocp-bootstrap-ign --key bootstrap.ign --region eu-de --force 2>/dev/null
+ibmcloud cos object-delete --bucket ocp-rhcos-image --key rhcos.qcow2 --region eu-de --force 2>/dev/null
 
 # Remove install directory
 rm -rf ~/ocp-h100-upi-install
+```
+
+### Teardown Step 5: Delete VPC Resources (Phase 0)
+
+```bash
+# Delete VPE gateways (auto-created by IBM Cloud, block subnet deletion)
+for vpe in $(ibmcloud is endpoint-gateways --output json | jq -r '.[].id'); do
+  ibmcloud is endpoint-gateway-delete $vpe --force
+done
+
+# Detach public gateway from subnet
+echo "y" | ibmcloud is subnet-public-gateway-detach $MGMT_SUBNET_ID
+
+# Delete subnet (should succeed since Step 2 confirmed LB reserved IPs are cleared)
+ibmcloud is subnet-delete $MGMT_SUBNET_ID --force
+
+# Delete public gateway
+ibmcloud is public-gateway-delete ocp-pgw --force
+
+# Delete address prefix
+ADDR_PREFIX_ID=$(ibmcloud is vpc-address-prefixes $VPC_ID --output json | jq -r '.[] | select(.name=="mgmt-prefix") | .id')
+ibmcloud is vpc-address-prefix-delete $VPC_ID $ADDR_PREFIX_ID --force
+
+# Delete VPC
+ibmcloud is vpc-delete $VPC_ID --force
+```
+
+### Teardown Step 6: Clear Environment Variables
+
+```bash
+sed -i '' "s/^export VPC_ID=.*/export VPC_ID=/" ~/.ibmcloud-h100-env
+sed -i '' "s/^export MGMT_SUBNET_ID=.*/export MGMT_SUBNET_ID=/" ~/.ibmcloud-h100-env
+sed -i '' "s/^export OCP_SG_ID=.*/export OCP_SG_ID=/" ~/.ibmcloud-h100-env
+source ~/.ibmcloud-h100-env
+echo "Environment variables cleared"
 ```
 
 ---

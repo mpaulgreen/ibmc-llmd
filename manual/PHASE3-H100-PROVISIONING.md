@@ -1,17 +1,21 @@
-# Phase 3: Provision H100 GPU Instance
+# Phase 3: Create Cluster Network and Provision H100 GPU Instance
 
 ## Overview
 
-This phase provisions the H100 GPU instance with 8× NVIDIA H100 GPUs and attaches 8 cluster network interfaces for RDMA connectivity.
+This phase creates the RDMA cluster network from scratch, provisions an H100 GPU instance, and attaches the cluster network interfaces for RDMA connectivity.
 
 **What You'll Accomplish:**
-- Find appropriate RHCOS image for H100 instance
-- Create H100 instance with VPC management network
+- Create the cluster network with `hopper-1` profile
+- Create 8 cluster network subnets (one per GPU rail)
+- Use the RHCOS image for the OpenShift worker node
+- Create the GPU instance with VPC management network
 - Stop instance (required for cluster network attachment)
-- Create and attach 8 cluster network interfaces
+- Create and attach 8 cluster network interfaces (one per GPU rail)
 - Start instance and initialize RDMA fabric
+- Create floating IP for SSH access
+- Validate GPU and RDMA hardware
 
-**Estimated Time**: 20-30 minutes
+**Estimated Time**: 30-45 minutes
 
 ## Pre-Flight Checks
 
@@ -32,6 +36,7 @@ ibmcloud target
 Verify region is `eu-de`.
 
 ```bash
+export KUBECONFIG=$HOME/ocp-h100-upi-install/auth/kubeconfig
 oc get nodes
 ```
 
@@ -43,10 +48,25 @@ Should show 3 master nodes in Ready state.
 
 ### Step 1: Load Environment
 
-Source the environment configuration:
-
 ```bash
 source ~/.ibmcloud-h100-env
+```
+
+Verify key variables are set (saved in Phase 2):
+
+```bash
+echo "VPC_ID:        $VPC_ID"
+echo "MGMT_SUBNET_ID: $MGMT_SUBNET_ID"
+echo "OCP_SG_ID:     $OCP_SG_ID"
+```
+
+If any are empty, recover them:
+
+```bash
+[ -z "$VPC_ID" ] && export VPC_ID=$(ibmcloud is vpcs --output json | jq -r '.[] | select(.name=="rdma-pvc-eude") | .id') && sed -i '' "s/^export VPC_ID=.*/export VPC_ID=$VPC_ID/" ~/.ibmcloud-h100-env
+[ -z "$MGMT_SUBNET_ID" ] && export MGMT_SUBNET_ID=$(ibmcloud is subnets --output json | jq -r '.[] | select(.name=="ocp-mgmt-subnet") | .id') && sed -i '' "s/^export MGMT_SUBNET_ID=.*/export MGMT_SUBNET_ID=$MGMT_SUBNET_ID/" ~/.ibmcloud-h100-env
+[ -z "$OCP_SG_ID" ] && export OCP_SG_ID=$(ibmcloud is security-groups --output json | jq -r '.[] | select(.name=="ocp-h100-cluster-sg") | .id') && sed -i '' "s/^export OCP_SG_ID=.*/export OCP_SG_ID=$OCP_SG_ID/" ~/.ibmcloud-h100-env
+echo "VPC_ID=$VPC_ID  MGMT_SUBNET_ID=$MGMT_SUBNET_ID  OCP_SG_ID=$OCP_SG_ID"
 ```
 
 ### Step 2: Login to IBM Cloud
@@ -57,115 +77,170 @@ ibmcloud_login
 
 ---
 
-### Step 3: Find RHCOS Image
+### Step 3: Create Cluster Network
 
-#### 3a. Search for RHCOS Images
+> **What this creates**: A managed RDMA fabric for H100 GPU instances using the `hopper-1` profile. This provides 8x 400 Gbps ConnectX-7 NICs (3.2 Tbps total bandwidth) with RoCE v2 and GPU Direct RDMA.
 
-List available RHCOS images in your region:
-
-```bash
-ibmcloud is images --output json | jq -r '.[] | select(.name | contains("rhcos")) | select(.status == "available") | "\(.name) - \(.id)"'
-```
-
-**Expected Output:**
-```
-rhcos-4.x-xxx... - r010-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-```
-
-Take note of the image ID (the `r010-...` part).
-
-#### 3b. Set Image ID
-
-If you found an RHCOS image above, set it:
+#### 3a. Check for Existing Cluster Network
 
 ```bash
-export IMAGE_ID="<paste-the-image-id-here>"
+ibmcloud is cluster-networks --output json | jq -r '.[] | select(.name=="rdma-cluster") | {name, id, lifecycle_state}'
 ```
 
-Replace `<paste-the-image-id-here>` with actual ID from step 3a.
+**If empty** — no cluster network exists. Proceed to 3b.
 
-**If no RHCOS image found:**
+**If a cluster network is shown** — set `export CN_ID=<id>` and skip to Step 4.
 
-You'll need to import one or use a RHEL-based image. For this guide, we'll assume you have an RHCOS image. If you need to import one, see the Red Hat documentation for downloading RHCOS qcow2 images and importing to IBM Cloud Object Storage.
+#### 3b. Create Cluster Network
 
-**Alternative - Use any RHEL/RHCOS image:**
 ```bash
-# Find any suitable image
-ibmcloud is images --output json | jq -r '.[] | select(.status == "available") | "\(.name) - \(.id)"' | head -5
+ibmcloud is cluster-network-create \
+  --vpc $VPC_ID \
+  --zone $IBMCLOUD_ZONE \
+  --profile hopper-1 \
+  --name rdma-cluster \
+  --subnet-prefixes-cidr 10.0.0.0/9 \
+  --output json > /tmp/cluster-network-create.json
 ```
 
-Pick one and set IMAGE_ID to its ID.
-
-#### 3c. Get Image Details
+#### 3c. Get Cluster Network ID
 
 ```bash
-ibmcloud is image $IMAGE_ID --output json > /tmp/image-info.json
+export CN_ID=$(jq -r '.id' /tmp/cluster-network-create.json)
+echo "Cluster Network ID: $CN_ID"
 ```
 
+#### 3d. Wait for Cluster Network to be Stable
+
 ```bash
-export IMAGE_NAME=$(cat /tmp/image-info.json | jq -r '.name')
-echo "Using image: $IMAGE_NAME"
-echo "Image ID: $IMAGE_ID"
+while true; do
+  STATUS=$(ibmcloud is cluster-network $CN_ID --output json | jq -r '.lifecycle_state')
+  echo "  Status: $STATUS ($(date '+%H:%M:%S'))"
+  [ "$STATUS" = "stable" ] && break
+  sleep 10
+done
+echo "Cluster network is ready"
+```
+
+#### 3e. Save to Environment File
+
+```bash
+sed -i '' "s/^export CN_ID=.*/export CN_ID=$CN_ID/" ~/.ibmcloud-h100-env
 ```
 
 ---
 
-### Step 4: Check for Existing H100 Instance
+### Step 4: Create 8 Cluster Network Subnets
 
-Check if an instance named `ocp-h100-worker` already exists:
+> **Why 8 subnets?** The `hopper-1` profile does NOT auto-create subnets. Each H100 has 8 GPU rails, each needing its own cluster network subnet. Each /18 subnet provides 16,384 addresses.
 
-```bash
-export EXISTING_INSTANCE=$(ibmcloud is instances --output json | jq -r '.[] | select(.name == "ocp-h100-worker") | .id')
-echo "Existing instance: $EXISTING_INSTANCE"
-```
-
-**If output is empty**, no existing instance. **Skip to Step 5.**
-
-**If an instance ID is shown:**
-
-⚠️ **WARNING**: Instance `ocp-h100-worker` already exists!
-
-**Option A - Use Existing Instance:**
-
-Set the environment variable and skip to Phase 4:
+#### 4a. Create Subnets
 
 ```bash
-export H100_INSTANCE_ID=$EXISTING_INSTANCE
-echo "export H100_INSTANCE_ID=$H100_INSTANCE_ID" >> ~/.ibmcloud-h100-env
-echo "Using existing instance: $H100_INSTANCE_ID"
+for i in $(seq 1 8); do
+  idx=$((i-1))
+  echo -n "Creating rdma-subnet-${idx}... "
+  ibmcloud is cluster-network-subnet-create $CN_ID \
+    --total-ipv4-address-count 16384 \
+    --name "rdma-subnet-${idx}" \
+    --output json > /tmp/cn-subnet-${idx}.json
+  echo "$(jq -r '.id' /tmp/cn-subnet-${idx}.json)"
+done
+echo "Done"
 ```
 
-Then skip to **Phase 4: Worker Integration**.
-
-**Option B - Delete and Recreate:**
-
-⚠️ **DESTRUCTIVE**: This will delete the instance!
+#### 4b. Save Subnet IDs to Environment File
 
 ```bash
-ibmcloud is instance-delete $EXISTING_INSTANCE --force
+for i in $(seq 0 7); do
+  SUBNET_ID=$(jq -r '.id' /tmp/cn-subnet-${i}.json)
+  sed -i '' "s/^export CN_SUBNET_ID_${i}=.*/export CN_SUBNET_ID_${i}=$SUBNET_ID/" ~/.ibmcloud-h100-env
+done
+source ~/.ibmcloud-h100-env
+echo "Saved all 8 subnet IDs to env file"
 ```
-
-Wait for deletion to complete:
-
-```bash
-sleep 30
-```
-
-Verify it's deleted:
-
-```bash
-ibmcloud is instances | grep ocp-h100-worker
-```
-
-Should return no results. Proceed to Step 5.
 
 ---
 
-### Step 5: Create H100 Instance
+### Step 5: Verify Cluster Network and Subnets
 
-#### 5a. Review Instance Configuration
+#### 5a. Verify Cluster Network
 
-Display what will be created:
+```bash
+ibmcloud is cluster-network $CN_ID --output json | jq '{name, id, lifecycle_state, profile: .profile.name, subnet_prefix: .subnet_prefixes[0].cidr}'
+```
+
+**Expected**: name `rdma-cluster`, lifecycle_state `stable`, profile `hopper-1`, subnet_prefix `10.0.0.0/9`
+
+#### 5b. Verify All 8 Subnets
+
+```bash
+ibmcloud is cluster-network-subnets $CN_ID --output json | \
+  jq -r '.ClusterNetworkSubnets[] | "\(.name): \(.ipv4_cidr_block) [\(.lifecycle_state)]"' | sort
+```
+
+**Expected**: 8 subnets (`rdma-subnet-0` through `rdma-subnet-7`), all `stable`, each with a /18 CIDR from the 10.0.0.0/9 range.
+
+#### 5c. Verify Env File Saved Correctly
+
+```bash
+for i in $(seq 0 7); do
+  eval echo "CN_SUBNET_ID_$i=\$CN_SUBNET_ID_$i"
+done
+```
+
+All 8 should show non-empty IDs.
+
+---
+
+### Step 6: Set RHCOS Image
+
+Use the RHCOS custom image imported during Phase 2 (Step 7). The instance boots with the worker ignition config and joins the OpenShift cluster automatically. NVIDIA drivers are installed later via the GPU Operator (Phase 6).
+
+```bash
+export IMAGE_ID=$(ibmcloud is images --visibility private --output json | jq -r '.[] | select(.name=="ocp-rhcos") | .id')
+echo "RHCOS Image ID: $IMAGE_ID"
+```
+
+If empty, you need to import RHCOS first — see Phase 2 Step 7.
+
+#### Verify Image
+
+```bash
+export IMAGE_NAME=$(ibmcloud is image $IMAGE_ID --output json | jq -r '.name')
+echo "Using image: $IMAGE_NAME ($IMAGE_ID)"
+```
+
+---
+
+### Step 7: Check for Existing H100 Instance
+
+```bash
+EXISTING_INSTANCE=$(ibmcloud is instances --output json | jq -r '.[] | select(.name == "ocp-gpu-worker-h100") | .id')
+echo "Existing instance: ${EXISTING_INSTANCE:-none}"
+```
+
+**If empty** — no existing instance. Proceed to Step 8.
+
+**If an instance ID is shown** — instance already exists. Choose:
+
+- **Use it**: Set `export H100_INSTANCE_ID=$EXISTING_INSTANCE` and skip to Step 10 (or Step 11 if it's running and you need to attach cluster networks).
+- **Delete and recreate**: `ibmcloud is instance-delete $EXISTING_INSTANCE --force` then wait 30s and proceed to Step 8.
+
+---
+
+### Step 8: Create H100 Instance
+
+#### 8a. Verify Worker Ignition Config
+
+> **Why user-data?** The IBM Cloud `--keys` flag silently fails for GPU instances. For RHCOS, the worker ignition config is passed via `--user-data` — this configures the node to join the OpenShift cluster.
+
+```bash
+# The worker.ign was generated in Phase 2 Step 4c
+ls -la ~/ocp-h100-upi-install/worker.ign
+```
+
+#### 8b. Review Configuration
 
 ```bash
 cat << EOF
@@ -174,187 +249,117 @@ cat << EOF
 H100 Instance Configuration
 ========================================
 
-Name:              ocp-h100-worker
+Name:              ocp-gpu-worker-h100
 Profile:           $GPU_PROFILE
 VPC:               $VPC_NAME ($VPC_ID)
 Zone:              $IBMCLOUD_ZONE
 Management Subnet: $MGMT_SUBNET_ID
-Security Group:    $SG_ID
-SSH Key:           $KEY_ID
+Security Group:    $OCP_SG_ID (ocp-h100-cluster-sg — same as masters)
 Image:             $IMAGE_NAME
 
 Instance Specs (gx3d-160x1792x8h100):
   - 160 vCPUs
   - 1.75TB RAM
-  - 8× NVIDIA H100 SXM5 GPUs (80GB each)
+  - 8x NVIDIA H100 SXM5 GPUs (80GB each)
   - 640GB total GPU memory
 
-⚠️  Cost: ~\$30-40 per hour while running
-⚠️  This is a significant cost - ensure you need this instance
+Cost: ~\$30-40 per hour while running
 
 ========================================
 
 EOF
 ```
 
-**Review this carefully.** H100 costs are high!
-
-#### 5b. Create Instance
-
-⚠️ **CRITICAL CHECKPOINT**
-
-You are about to create an H100 instance that costs ~$30-40 per hour.
-
-**Ready to proceed? If yes, run:**
+#### 8c. Create Instance
 
 ```bash
-ibmcloud is instance-create \
-    ocp-h100-worker \
-    $VPC_ID \
-    $IBMCLOUD_ZONE \
-    $GPU_PROFILE \
-    $MGMT_SUBNET_ID \
-    --image $IMAGE_ID \
-    --keys $KEY_ID \
-    --security-groups $SG_ID \
-    --output json > /tmp/h100-instance-create.json
+ibmcloud is instance-create ocp-gpu-worker-h100 \
+  $VPC_ID \
+  eu-de-2 \
+  $GPU_PROFILE \
+  $MGMT_SUBNET_ID \
+  --image $IMAGE_ID \
+  --user-data @$HOME/ocp-h100-upi-install/worker.ign \
+  --sgs $OCP_SG_ID \
+  --metadata-service true \
+  --output json > /tmp/h100-instance.json
 ```
 
-This will take 5-10 minutes to create the instance.
-
-#### 5c. Get Instance ID
+#### 8d. Get and Save Instance ID
 
 ```bash
-export H100_INSTANCE_ID=$(cat /tmp/h100-instance-create.json | jq -r '.id')
+export H100_INSTANCE_ID=$(jq -r '.id' /tmp/h100-instance.json)
 echo "H100 Instance ID: $H100_INSTANCE_ID"
 ```
 
-**If empty or 'null':**
+If empty or `null`, check the output: `cat /tmp/h100-instance.json`
 
-Creation failed. Check the output:
-
-```bash
-cat /tmp/h100-instance-create.json
-```
-
-Common failures:
-- Quota exceeded
-- Profile not available in zone
-- Invalid parameters
-
-#### 5d. Save Instance ID to Environment
+Save to environment file:
 
 ```bash
-echo "" >> ~/.ibmcloud-h100-env
-echo "# H100 Instance (created $(date))" >> ~/.ibmcloud-h100-env
-echo "export H100_INSTANCE_ID=$H100_INSTANCE_ID" >> ~/.ibmcloud-h100-env
-```
-
-Reload environment:
-
-```bash
+sed -i '' "s/^export H100_INSTANCE_ID=.*/export H100_INSTANCE_ID=$H100_INSTANCE_ID/" ~/.ibmcloud-h100-env
 source ~/.ibmcloud-h100-env
 ```
 
 ---
 
-### Step 6: Wait for Instance to Start
-
-Monitor instance status:
-
-```bash
-watch -n 10 "ibmcloud is instance $H100_INSTANCE_ID --output json | jq -r '.status'"
-```
-
-**Expected progression:**
-- `pending` → `starting` → `running`
-
-Press `Ctrl+C` when status shows `running`.
-
-**Or use a manual check loop:**
+### Step 9: Wait for Instance to Start
 
 ```bash
 while true; do
-    STATUS=$(ibmcloud is instance $H100_INSTANCE_ID --output json | jq -r '.status')
-    echo "Status: $STATUS"
-    if [ "$STATUS" = "running" ]; then
-        echo "✅ Instance is running"
-        break
-    elif [ "$STATUS" = "failed" ]; then
-        echo "❌ Instance failed to start"
-        ibmcloud is instance $H100_INSTANCE_ID
-        exit 1
-    fi
-    sleep 10
+  STATUS=$(ibmcloud is instance $H100_INSTANCE_ID --output json | jq -r '.status')
+  echo "  Status: $STATUS ($(date '+%H:%M:%S'))"
+  if [ "$STATUS" = "running" ]; then
+    echo "Instance is running"
+    break
+  elif [ "$STATUS" = "failed" ]; then
+    echo "Instance failed to start"
+    ibmcloud is instance $H100_INSTANCE_ID
+    break
+  fi
+  sleep 10
 done
 ```
 
-**Expected time**: 5-10 minutes
+**Expected time**: 2-5 minutes
 
 ---
 
-### Step 7: Get Instance Details
-
-Fetch full instance information:
+### Step 10: Get Instance Details
 
 ```bash
-ibmcloud is instance $H100_INSTANCE_ID --output json > /tmp/h100-instance.json
-```
+ibmcloud is instance $H100_INSTANCE_ID --output json > /tmp/h100-instance-details.json
 
-Extract key details:
-
-```bash
-export INSTANCE_NAME=$(cat /tmp/h100-instance.json | jq -r '.name')
-export INSTANCE_STATUS=$(cat /tmp/h100-instance.json | jq -r '.status')
-export INSTANCE_ZONE=$(cat /tmp/h100-instance.json | jq -r '.zone.name')
-export PRIVATE_IP=$(cat /tmp/h100-instance.json | jq -r '.primary_network_interface.primary_ip.address')
-
-echo "Instance Name:   $INSTANCE_NAME"
-echo "Status:          $INSTANCE_STATUS"
-echo "Zone:            $INSTANCE_ZONE"
-echo "Private IP:      $PRIVATE_IP"
-echo "Profile:         $GPU_PROFILE"
-```
-
-Check for floating/public IP:
-
-```bash
-export FLOATING_IP=$(cat /tmp/h100-instance.json | jq -r '.primary_network_interface.floating_ips[0].address // empty')
-
-if [ -n "$FLOATING_IP" ]; then
-    echo "Public IP:       $FLOATING_IP"
-    echo "SSH Command:     ssh root@$FLOATING_IP"
-else
-    echo "⚠️  No public IP assigned"
-    echo "    SSH requires VPN or bastion host"
-fi
+echo "Name:       $(jq -r '.name' /tmp/h100-instance-details.json)"
+echo "Status:     $(jq -r '.status' /tmp/h100-instance-details.json)"
+echo "Zone:       $(jq -r '.zone.name' /tmp/h100-instance-details.json)"
+echo "Private IP: $(jq -r '.primary_network_interface.primary_ip.address' /tmp/h100-instance-details.json)"
+echo "Profile:    $GPU_PROFILE"
 ```
 
 ---
 
-### Step 8: Stop Instance for Cluster Network Attachment
+### Step 11: Stop Instance for Cluster Network Attachment
 
-⚠️ **IMPORTANT**: Cluster network interfaces can **only** be attached when the instance is **STOPPED**.
+> **CRITICAL**: Cluster network interfaces can ONLY be attached when the instance is STOPPED.
 
-#### 8a. Stop the Instance
+#### 11a. Stop the Instance
 
 ```bash
 ibmcloud is instance-stop $H100_INSTANCE_ID --force
 ```
 
-#### 8b. Wait for Instance to Stop
-
-Monitor status:
+#### 11b. Wait for Stop
 
 ```bash
 while true; do
-    STATUS=$(ibmcloud is instance $H100_INSTANCE_ID --output json | jq -r '.status')
-    echo "Status: $STATUS"
-    if [ "$STATUS" = "stopped" ]; then
-        echo "✅ Instance stopped"
-        break
-    fi
-    sleep 10
+  STATUS=$(ibmcloud is instance $H100_INSTANCE_ID --output json | jq -r '.status')
+  echo "  Status: $STATUS ($(date '+%H:%M:%S'))"
+  if [ "$STATUS" = "stopped" ]; then
+    echo "Instance stopped"
+    break
+  fi
+  sleep 10
 done
 ```
 
@@ -362,503 +367,187 @@ done
 
 ---
 
-### Step 9: Verify Cluster Network Configuration
+### Step 12: Create and Attach Cluster Network Interfaces
 
-Before attaching interfaces, verify the cluster network and subnets:
+Now we create 8 cluster network interfaces (one per GPU rail) and attach them to the stopped H100 instance.
 
-#### 9a. Check Cluster Network
-
-```bash
-ibmcloud is cluster-network $CN_ID --output json > /tmp/cluster-network.json
-```
+#### 12a. Create 8 Cluster Network Interfaces
 
 ```bash
-cat /tmp/cluster-network.json | jq -r '"\(.name) - \(.lifecycle_state) - \(.profile.name)"'
+echo "Creating 8 cluster network interfaces..."
+for i in $(seq 0 7); do
+  eval SUBNET_ID=\$CN_SUBNET_ID_$i
+  echo -n "  Rail $i: "
+  ibmcloud is cluster-network-interface-create $CN_ID \
+    --subnet $SUBNET_ID \
+    --rip-auto-delete true \
+    --rip-name "h100-rail-${i}-rip" \
+    --name "h100-gpu-rail-${i}" \
+    --output json | jq -r '"\(.name) | \(.id) | \(.lifecycle_state)"'
+done
+echo "Done"
 ```
 
-**Expected Output:**
-```
-rdma-cluster - stable - hopper-1
-```
-
-Verify:
-- State is `stable` or `pending`
-- Profile is `hopper-1`
-
-#### 9b. Verify All 8 Cluster Network Subnets
-
-Check subnet 0:
+#### 12b. Attach 8 Interfaces to Instance
 
 ```bash
-ibmcloud is cluster-network-subnet $CN_ID $CN_SUBNET_ID_0 --output json | jq -r '.name, .id'
-```
-
-Check subnet 1:
-
-```bash
-ibmcloud is cluster-network-subnet $CN_ID $CN_SUBNET_ID_1 --output json | jq -r '.name, .id'
-```
-
-Check subnet 2:
-
-```bash
-ibmcloud is cluster-network-subnet $CN_ID $CN_SUBNET_ID_2 --output json | jq -r '.name, .id'
-```
-
-Check subnet 3:
-
-```bash
-ibmcloud is cluster-network-subnet $CN_ID $CN_SUBNET_ID_3 --output json | jq -r '.name, .id'
-```
-
-Check subnet 4:
-
-```bash
-ibmcloud is cluster-network-subnet $CN_ID $CN_SUBNET_ID_4 --output json | jq -r '.name, .id'
-```
-
-Check subnet 5:
-
-```bash
-ibmcloud is cluster-network-subnet $CN_ID $CN_SUBNET_ID_5 --output json | jq -r '.name, .id'
-```
-
-Check subnet 6:
-
-```bash
-ibmcloud is cluster-network-subnet $CN_ID $CN_SUBNET_ID_6 --output json | jq -r '.name, .id'
-```
-
-Check subnet 7:
-
-```bash
-ibmcloud is cluster-network-subnet $CN_ID $CN_SUBNET_ID_7 --output json | jq -r '.name, .id'
-```
-
-Each command should output a subnet name and ID. If any fail, that subnet doesn't exist.
-
----
-
-### Step 10: Create and Attach Cluster Network Interfaces
-
-Now we'll create 8 cluster network interfaces (one per GPU rail) and attach them to the H100 instance.
-
-⚠️ **IMPORTANT**: Execute these commands one at a time. Do not batch them.
-
-#### 10a. Create Interface for GPU Rail 0
-
-Create the interface:
-
-```bash
-ibmcloud is cluster-network-interface-create \
+echo "Attaching 8 interfaces to H100..."
+for i in $(seq 0 7); do
+  IFACE_ID=$(ibmcloud is cluster-network-interfaces $CN_ID --output json | \
+    jq -r ".[] | select(.name==\"h100-gpu-rail-${i}\") | .id")
+  echo -n "  Rail $i ($IFACE_ID): "
+  ibmcloud is instance-cluster-network-attachment-create $H100_INSTANCE_ID \
+    --cni $IFACE_ID \
     --cluster-network $CN_ID \
-    --subnet $CN_SUBNET_ID_0 \
-    --name "h100-gpu-rail-0" \
-    --output json > /tmp/cn-interface-0.json
-```
-
-Get interface ID:
-
-```bash
-export CN_INTERFACE_0_ID=$(cat /tmp/cn-interface-0.json | jq -r '.id')
-echo "Interface 0 ID: $CN_INTERFACE_0_ID"
-```
-
-Attach to instance:
-
-```bash
-ibmcloud is instance-cluster-network-attachment-create \
-    $H100_INSTANCE_ID \
-    --cluster-network-interface $CN_INTERFACE_0_ID \
-    --name "h100-attachment-0" \
-    --output json > /tmp/cn-attachment-0.json
-```
-
-Verify attachment:
-
-```bash
-cat /tmp/cn-attachment-0.json | jq -r '.name, .lifecycle_state'
-```
-
-**Expected**: Shows attachment name and state (likely `pending` or `stable`)
-
-#### 10b. Create Interface for GPU Rail 1
-
-Create the interface:
-
-```bash
-ibmcloud is cluster-network-interface-create \
-    --cluster-network $CN_ID \
-    --subnet $CN_SUBNET_ID_1 \
-    --name "h100-gpu-rail-1" \
-    --output json > /tmp/cn-interface-1.json
-```
-
-Get interface ID:
-
-```bash
-export CN_INTERFACE_1_ID=$(cat /tmp/cn-interface-1.json | jq -r '.id')
-echo "Interface 1 ID: $CN_INTERFACE_1_ID"
-```
-
-Attach to instance:
-
-```bash
-ibmcloud is instance-cluster-network-attachment-create \
-    $H100_INSTANCE_ID \
-    --cluster-network-interface $CN_INTERFACE_1_ID \
-    --name "h100-attachment-1" \
-    --output json > /tmp/cn-attachment-1.json
-```
-
-Verify:
-
-```bash
-cat /tmp/cn-attachment-1.json | jq -r '.name, .lifecycle_state'
-```
-
-#### 10c. Create Interface for GPU Rail 2
-
-Create the interface:
-
-```bash
-ibmcloud is cluster-network-interface-create \
-    --cluster-network $CN_ID \
-    --subnet $CN_SUBNET_ID_2 \
-    --name "h100-gpu-rail-2" \
-    --output json > /tmp/cn-interface-2.json
-```
-
-Get interface ID:
-
-```bash
-export CN_INTERFACE_2_ID=$(cat /tmp/cn-interface-2.json | jq -r '.id')
-echo "Interface 2 ID: $CN_INTERFACE_2_ID"
-```
-
-Attach to instance:
-
-```bash
-ibmcloud is instance-cluster-network-attachment-create \
-    $H100_INSTANCE_ID \
-    --cluster-network-interface $CN_INTERFACE_2_ID \
-    --name "h100-attachment-2" \
-    --output json > /tmp/cn-attachment-2.json
-```
-
-Verify:
-
-```bash
-cat /tmp/cn-attachment-2.json | jq -r '.name, .lifecycle_state'
-```
-
-#### 10d. Create Interface for GPU Rail 3
-
-Create the interface:
-
-```bash
-ibmcloud is cluster-network-interface-create \
-    --cluster-network $CN_ID \
-    --subnet $CN_SUBNET_ID_3 \
-    --name "h100-gpu-rail-3" \
-    --output json > /tmp/cn-interface-3.json
-```
-
-Get interface ID:
-
-```bash
-export CN_INTERFACE_3_ID=$(cat /tmp/cn-interface-3.json | jq -r '.id')
-echo "Interface 3 ID: $CN_INTERFACE_3_ID"
-```
-
-Attach to instance:
-
-```bash
-ibmcloud is instance-cluster-network-attachment-create \
-    $H100_INSTANCE_ID \
-    --cluster-network-interface $CN_INTERFACE_3_ID \
-    --name "h100-attachment-3" \
-    --output json > /tmp/cn-attachment-3.json
-```
-
-Verify:
-
-```bash
-cat /tmp/cn-attachment-3.json | jq -r '.name, .lifecycle_state'
-```
-
-#### 10e. Create Interface for GPU Rail 4
-
-Create the interface:
-
-```bash
-ibmcloud is cluster-network-interface-create \
-    --cluster-network $CN_ID \
-    --subnet $CN_SUBNET_ID_4 \
-    --name "h100-gpu-rail-4" \
-    --output json > /tmp/cn-interface-4.json
-```
-
-Get interface ID:
-
-```bash
-export CN_INTERFACE_4_ID=$(cat /tmp/cn-interface-4.json | jq -r '.id')
-echo "Interface 4 ID: $CN_INTERFACE_4_ID"
-```
-
-Attach to instance:
-
-```bash
-ibmcloud is instance-cluster-network-attachment-create \
-    $H100_INSTANCE_ID \
-    --cluster-network-interface $CN_INTERFACE_4_ID \
-    --name "h100-attachment-4" \
-    --output json > /tmp/cn-attachment-4.json
-```
-
-Verify:
-
-```bash
-cat /tmp/cn-attachment-4.json | jq -r '.name, .lifecycle_state'
-```
-
-#### 10f. Create Interface for GPU Rail 5
-
-Create the interface:
-
-```bash
-ibmcloud is cluster-network-interface-create \
-    --cluster-network $CN_ID \
-    --subnet $CN_SUBNET_ID_5 \
-    --name "h100-gpu-rail-5" \
-    --output json > /tmp/cn-interface-5.json
-```
-
-Get interface ID:
-
-```bash
-export CN_INTERFACE_5_ID=$(cat /tmp/cn-interface-5.json | jq -r '.id')
-echo "Interface 5 ID: $CN_INTERFACE_5_ID"
-```
-
-Attach to instance:
-
-```bash
-ibmcloud is instance-cluster-network-attachment-create \
-    $H100_INSTANCE_ID \
-    --cluster-network-interface $CN_INTERFACE_5_ID \
-    --name "h100-attachment-5" \
-    --output json > /tmp/cn-attachment-5.json
-```
-
-Verify:
-
-```bash
-cat /tmp/cn-attachment-5.json | jq -r '.name, .lifecycle_state'
-```
-
-#### 10g. Create Interface for GPU Rail 6
-
-Create the interface:
-
-```bash
-ibmcloud is cluster-network-interface-create \
-    --cluster-network $CN_ID \
-    --subnet $CN_SUBNET_ID_6 \
-    --name "h100-gpu-rail-6" \
-    --output json > /tmp/cn-interface-6.json
-```
-
-Get interface ID:
-
-```bash
-export CN_INTERFACE_6_ID=$(cat /tmp/cn-interface-6.json | jq -r '.id')
-echo "Interface 6 ID: $CN_INTERFACE_6_ID"
-```
-
-Attach to instance:
-
-```bash
-ibmcloud is instance-cluster-network-attachment-create \
-    $H100_INSTANCE_ID \
-    --cluster-network-interface $CN_INTERFACE_6_ID \
-    --name "h100-attachment-6" \
-    --output json > /tmp/cn-attachment-6.json
-```
-
-Verify:
-
-```bash
-cat /tmp/cn-attachment-6.json | jq -r '.name, .lifecycle_state'
-```
-
-#### 10h. Create Interface for GPU Rail 7
-
-Create the interface:
-
-```bash
-ibmcloud is cluster-network-interface-create \
-    --cluster-network $CN_ID \
-    --subnet $CN_SUBNET_ID_7 \
-    --name "h100-gpu-rail-7" \
-    --output json > /tmp/cn-interface-7.json
-```
-
-Get interface ID:
-
-```bash
-export CN_INTERFACE_7_ID=$(cat /tmp/cn-interface-7.json | jq -r '.id')
-echo "Interface 7 ID: $CN_INTERFACE_7_ID"
-```
-
-Attach to instance:
-
-```bash
-ibmcloud is instance-cluster-network-attachment-create \
-    $H100_INSTANCE_ID \
-    --cluster-network-interface $CN_INTERFACE_7_ID \
-    --name "h100-attachment-7" \
-    --output json > /tmp/cn-attachment-7.json
-```
-
-Verify:
-
-```bash
-cat /tmp/cn-attachment-7.json | jq -r '.name, .lifecycle_state'
+    --name "h100-gpu-rail-${i}" \
+    --output json | jq -r '"\(.name) | \(.lifecycle_state)"'
+done
+echo "Done"
 ```
 
 ---
 
-### Step 11: Verify All Attachments
-
-List all cluster network attachments:
+### Step 13: Verify All Attachments
 
 ```bash
-ibmcloud is instance-cluster-network-attachments $H100_INSTANCE_ID --output json > /tmp/all-attachments.json
+echo "Attachments: $(ibmcloud is instance-cluster-network-attachments $H100_INSTANCE_ID --output json | jq '. | length') (expected: 8)"
+echo ""
+ibmcloud is instance-cluster-network-attachments $H100_INSTANCE_ID --output json | \
+  jq -r '.[] | "\(.name): \(.lifecycle_state)"'
 ```
 
-Count attachments:
-
-```bash
-cat /tmp/all-attachments.json | jq '. | length'
-```
-
-**Expected**: `8`
-
-List attachment details:
-
-```bash
-cat /tmp/all-attachments.json | jq -r '.[] | "\(.name): \(.lifecycle_state)"'
-```
-
-**Expected Output:**
-```
-h100-attachment-0: stable
-h100-attachment-1: stable
-h100-attachment-2: stable
-h100-attachment-3: stable
-h100-attachment-4: stable
-h100-attachment-5: stable
-h100-attachment-6: stable
-h100-attachment-7: stable
-```
-
-All should show `stable` state (or `pending` if still being configured).
+All 8 should show `stable` (or `pending` if still configuring — they'll become `stable` when the instance starts).
 
 ---
 
-### Step 12: Save Interface IDs to Environment
+### Step 14: Start H100 Instance
 
-Save all interface IDs for reference:
-
-```bash
-cat >> ~/.ibmcloud-h100-env << EOF
-
-# Cluster Network Interface IDs (created $(date))
-export CN_INTERFACE_0_ID=$CN_INTERFACE_0_ID
-export CN_INTERFACE_1_ID=$CN_INTERFACE_1_ID
-export CN_INTERFACE_2_ID=$CN_INTERFACE_2_ID
-export CN_INTERFACE_3_ID=$CN_INTERFACE_3_ID
-export CN_INTERFACE_4_ID=$CN_INTERFACE_4_ID
-export CN_INTERFACE_5_ID=$CN_INTERFACE_5_ID
-export CN_INTERFACE_6_ID=$CN_INTERFACE_6_ID
-export CN_INTERFACE_7_ID=$CN_INTERFACE_7_ID
-EOF
-```
-
----
-
-### Step 13: Start H100 Instance
-
-Now start the instance. This will initialize the RDMA fabric.
-
-#### 13a. Start Instance
+#### 14a. Start Instance
 
 ```bash
 ibmcloud is instance-start $H100_INSTANCE_ID
 ```
 
-#### 13b. Wait for Instance to Start
+#### 14b. Wait for Running
 
-Monitor status:
+> **Note**: Starting with cluster networks takes 10-15 minutes — the RDMA fabric and GPU Fabric Manager must initialize. This is expected.
 
 ```bash
 while true; do
-    STATUS=$(ibmcloud is instance $H100_INSTANCE_ID --output json | jq -r '.status')
-    echo "Status: $STATUS"
-    if [ "$STATUS" = "running" ]; then
-        echo "✅ Instance is running"
-        break
-    elif [ "$STATUS" = "failed" ]; then
-        echo "❌ Instance failed to start"
-        exit 1
-    fi
-    sleep 10
+  STATUS=$(ibmcloud is instance $H100_INSTANCE_ID --output json | jq -r '.status')
+  echo "  Status: $STATUS ($(date '+%H:%M:%S'))"
+  if [ "$STATUS" = "running" ]; then
+    echo "Instance is running"
+    break
+  elif [ "$STATUS" = "failed" ]; then
+    echo "Instance failed to start"
+    break
+  fi
+  sleep 15
 done
 ```
 
-**Expected time**: 10-15 minutes
+---
 
-**Note**: Starting an H100 instance with cluster networks takes longer than normal because the RDMA fabric must initialize. This is expected.
+### Step 15: Create Floating IP for SSH Access
+
+> **IMPORTANT**: IBM Cloud uses the VirtualNetworkInterface (VNI) model. The floating IP attaches with `--vni`, NOT `--nic`.
+
+#### 15a. Get the Virtual Network Interface ID
+
+```bash
+H100_VNI=$(ibmcloud is instance $H100_INSTANCE_ID --output json | \
+  jq -r '.network_attachments[0].virtual_network_interface.id')
+echo "VNI: $H100_VNI"
+```
+
+#### 15b. Create Floating IP
+
+```bash
+ibmcloud is floating-ip-reserve h100-fip --vni $H100_VNI --output json | jq '{name, address}'
+```
+
+> If `h100-fip` already exists, get its address instead:
+> ```bash
+> ibmcloud is floating-ips --output json | jq -r '.[] | select(.name=="h100-fip") | .address'
+> ```
+
+#### 15c. Get Floating IP Address
+
+```bash
+export H100_FIP=$(ibmcloud is floating-ips --output json | jq -r '.[] | select(.name=="h100-fip") | .address')
+echo "H100 Floating IP: $H100_FIP"
+```
+
+#### 15d. Save to Environment
+
+```bash
+grep -q "H100_FIP" ~/.ibmcloud-h100-env || echo "export H100_FIP=$H100_FIP" >> ~/.ibmcloud-h100-env
+```
 
 ---
 
-### Step 14: Get Final Instance Information
+### Step 16: Validate Hardware
 
-Once running, get updated instance details:
+> Wait 10-15 minutes after start before attempting SSH. The GPU instance needs time for RDMA fabric initialization and Fabric Manager startup.
+
+#### 16a. Test SSH Connectivity
+
+SSH as `core` (the default RHCOS user):
 
 ```bash
-ibmcloud is instance $H100_INSTANCE_ID --output json > /tmp/h100-instance-final.json
+ssh -o ConnectTimeout=60 -i ~/.ssh/id_rsa core@$H100_FIP "hostname && uptime"
 ```
 
-Display summary:
+If connection times out, wait a few more minutes and retry — RHCOS with cluster networks takes 10-15 minutes to fully boot.
+
+#### 16b. Verify Instance Joined the Cluster
+
+From your local machine (not SSH):
 
 ```bash
-cat << EOF
+export KUBECONFIG=$HOME/ocp-h100-upi-install/auth/kubeconfig
+oc get nodes
+```
 
-========================================
-H100 Instance Summary
-========================================
+The H100 worker should appear (may show `NotReady` until CSRs are approved in Phase 4).
 
-Instance ID:        $H100_INSTANCE_ID
-Name:               $(cat /tmp/h100-instance-final.json | jq -r '.name')
-Status:             $(cat /tmp/h100-instance-final.json | jq -r '.status')
-Zone:               $(cat /tmp/h100-instance-final.json | jq -r '.zone.name')
-Profile:            $GPU_PROFILE
+#### 16c. Verify RDMA Devices (on instance via SSH)
 
-Private IP:         $(cat /tmp/h100-instance-final.json | jq -r '.primary_network_interface.primary_ip.address')
+> **Note**: GPU validation (`nvidia-smi`) and full RDMA tools (`ibv_devices`, `rdma link`) are not available on RHCOS until the GPU Operator (Phase 6) and NVIDIA Network Operator (Phase 5) are installed. For now, verify basic network connectivity.
 
-Cluster Network:    $CN_NAME
-Profile:            hopper-1
-Interfaces:         8 (one per GPU rail)
-Total Bandwidth:    3.2 Tbps (8× 400 Gbps)
+```bash
+ssh core@$H100_FIP "ip link show | grep -c enp"
+```
 
-GPUs:               8× NVIDIA H100 SXM5 (80GB each)
-Total GPU Memory:   640GB
+**Expected**: Multiple network interfaces (1 management + 8 RDMA).
 
-========================================
+---
 
-EOF
+### Step 17: Final Summary
+
+```bash
+echo ""
+echo "========================================"
+echo "H100 Instance Summary"
+echo "========================================"
+echo ""
+echo "Instance ID:     $H100_INSTANCE_ID"
+echo "Status:          $(ibmcloud is instance $H100_INSTANCE_ID --output json | jq -r '.status')"
+echo "Private IP:      $(ibmcloud is instance $H100_INSTANCE_ID --output json | jq -r '.primary_network_interface.primary_ip.address')"
+echo "Floating IP:     $H100_FIP"
+echo "Profile:         $GPU_PROFILE"
+echo "Image:           $IMAGE_NAME"
+echo ""
+echo "Cluster Network: $CN_NAME (hopper-1)"
+echo "Attachments:     $(ibmcloud is instance-cluster-network-attachments $H100_INSTANCE_ID --output json | jq '. | length') (expected: 8)"
+echo "Bandwidth:       3.2 Tbps (8x 400 Gbps ConnectX-7)"
+echo ""
+echo "GPUs:            8x NVIDIA H100 SXM5 (80GB each)"
+echo "Total GPU Mem:   640GB"
+echo ""
+echo "Cost:            ~\$30-40/hour while running"
+echo "========================================"
 ```
 
 ---
@@ -867,123 +556,145 @@ EOF
 
 At the end of Phase 3, you should have:
 
-- [x] **H100 instance created** (gx3d-160x1792x8h100 profile)
-- [x] **8× H100 GPUs** provisioned
-- [x] **VPC management network** attached (primary interface)
-- [x] **8 cluster network interfaces** created and attached
-- [x] **Instance running** with RDMA fabric initialized
-- [x] **Instance ID** saved to environment file
-- [x] **Interface IDs** saved to environment file
-
-### Verify Checklist
-
-```bash
-# Should show your H100 instance
-ibmcloud is instance $H100_INSTANCE_ID
-
-# Should show 8 attachments
-ibmcloud is instance-cluster-network-attachments $H100_INSTANCE_ID
-
-# Should show running status
-ibmcloud is instance $H100_INSTANCE_ID --output json | jq -r '.status'
-```
-
-If all show correct information, Phase 3 is complete!
+- [x] Cluster network created (`rdma-cluster`, `hopper-1` profile)
+- [x] 8 cluster network subnets created (`rdma-subnet-0` through `rdma-subnet-7`)
+- [x] H100 instance created (`gx3d-160x1792x8h100` profile)
+- [x] 8x H100 GPUs provisioned
+- [x] VPC management network attached (primary interface)
+- [x] 8 cluster network interfaces created and attached (all `stable`)
+- [x] Instance running with RDMA fabric initialized
+- [x] Floating IP assigned for SSH access
+- [x] All resource IDs saved to `~/.ibmcloud-h100-env`
 
 ---
 
-## Troubleshooting
+## Cost Management
 
-### Issue: Instance Creation Fails with Quota Error
-
-**Error**: "Quota exceeded for instances"
-
-**Solution:**
-- Check VPC quotas in IBM Cloud console
-- Delete unused instances
-- Request quota increase
-
-### Issue: Cannot Attach Cluster Network (Instance Not Stopped)
-
-**Error**: "Instance must be stopped"
-
-**Solution:**
-```bash
-ibmcloud is instance-stop $H100_INSTANCE_ID --force
-# Wait for stopped status, then retry attachment
-```
-
-### Issue: Cluster Network Interface Creation Fails
-
-**Possible causes:**
-- Cluster network not in stable state
-- Subnet doesn't exist
-- Permissions issue
-
-**Check cluster network state:**
-```bash
-ibmcloud is cluster-network $CN_ID --output json | jq -r '.lifecycle_state'
-```
-
-Must be `stable` or `pending`.
-
-### Issue: Instance Takes Too Long to Start
-
-Starting with cluster networks attached takes 10-15 minutes due to RDMA fabric initialization. This is normal.
-
-If > 20 minutes:
-- Check instance status in IBM Cloud console
-- Check for any errors in instance logs
-- Verify cluster network is healthy
-
-### Issue: Lost Track of Which Interfaces Were Created
-
-List all cluster network interfaces for the cluster network:
-
-```bash
-ibmcloud is cluster-network-interfaces $CN_ID --output json | jq -r '.[] | select(.name | startswith("h100-gpu-rail")) | "\(.name) - \(.id)"'
-```
-
-This shows all interfaces starting with "h100-gpu-rail".
-
----
-
-## Important Notes
-
-### H100 Costs
-
-The H100 instance is now **RUNNING** and **ACCRUING COSTS**:
-- ~$30-40 per hour
-- Runs continuously until stopped or deleted
+The H100 instance is **RUNNING** and **ACCRUING COSTS** (~$30-40/hour).
 
 **To stop costs temporarily:**
+
 ```bash
 ibmcloud is instance-stop $H100_INSTANCE_ID --force
 ```
 
 **To resume:**
+
 ```bash
 ibmcloud is instance-start $H100_INSTANCE_ID
 ```
 
-### RDMA Fabric
+> Starting with cluster networks attached takes 10-15 minutes.
 
-The 8 cluster network interfaces provide:
-- 8× ConnectX-7 NICs
-- 400 Gbps per interface
-- 3.2 Tbps total aggregate bandwidth
-- RoCE v2 protocol
-- GPU Direct RDMA capability
+---
 
-These will be configured in Phases 5-6.
+## Teardown
 
-### Instance Network Topology
+To delete all Phase 3 resources (reverse order of creation):
 
-The H100 instance now has:
-- **1 VPC network interface** (primary): For Kubernetes API, kubelet, pod networking
-- **8 cluster network interfaces**: For RDMA GPU-to-GPU communication
+### 1. Delete Floating IP
 
-This dual-network architecture separates management and high-performance data traffic.
+```bash
+ibmcloud is floating-ip-release h100-fip --force
+```
+
+### 2. Delete H100 Instance
+
+```bash
+ibmcloud is instance-delete $H100_INSTANCE_ID --force
+```
+
+Wait for deletion to complete (~30s):
+
+```bash
+while ibmcloud is instance $H100_INSTANCE_ID --output json 2>/dev/null | jq -r '.status' 2>/dev/null; do
+  echo "  Waiting for instance deletion..."
+  sleep 10
+done
+echo "Instance deleted"
+```
+
+### 3. Delete Cluster Network Interfaces
+
+```bash
+for IFACE_ID in $(ibmcloud is cluster-network-interfaces $CN_ID --output json | jq -r '.[].id'); do
+  echo -n "Deleting interface $IFACE_ID... "
+  ibmcloud is cluster-network-interface-delete $CN_ID $IFACE_ID --force 2>&1
+done
+```
+
+### 4. Delete 8 Cluster Network Subnets
+
+```bash
+for SUBNET_ID in $(ibmcloud is cluster-network-subnets $CN_ID --output json | jq -r '.ClusterNetworkSubnets[].id'); do
+  echo -n "Deleting subnet $SUBNET_ID... "
+  ibmcloud is cluster-network-subnet-delete $CN_ID $SUBNET_ID --force 2>&1
+done
+```
+
+### 5. Delete Cluster Network
+
+```bash
+ibmcloud is cluster-network-delete $CN_ID --force
+```
+
+### 6. Clear Environment Variables
+
+```bash
+sed -i '' "s/^export CN_ID=.*/export CN_ID=/" ~/.ibmcloud-h100-env
+sed -i '' "s/^export H100_INSTANCE_ID=.*/export H100_INSTANCE_ID=/" ~/.ibmcloud-h100-env
+for i in $(seq 0 7); do
+  sed -i '' "s/^export CN_SUBNET_ID_${i}=.*/export CN_SUBNET_ID_${i}=/" ~/.ibmcloud-h100-env
+done
+source ~/.ibmcloud-h100-env
+echo "Environment variables cleared"
+```
+
+---
+
+## Troubleshooting
+
+### Instance Creation Fails with Quota Error
+
+Check VPC quotas in IBM Cloud console. Delete unused instances or request quota increase.
+
+### Cannot Attach Cluster Network (Instance Not Stopped)
+
+```bash
+ibmcloud is instance-stop $H100_INSTANCE_ID --force
+# Wait for stopped status, then retry attachment
+```
+
+### Cluster Network Interface Creation Fails
+
+Check cluster network state — must be `stable`:
+
+```bash
+ibmcloud is cluster-network $CN_ID --output json | jq -r '.lifecycle_state'
+```
+
+### Instance Takes Too Long to Start (>20 min)
+
+Starting with cluster networks attached takes 10-15 minutes due to RDMA fabric initialization. If >20 minutes, check the instance in IBM Cloud console for errors.
+
+### Floating IP Already Exists
+
+If `h100-fip` exists from a previous run:
+
+```bash
+export H100_FIP=$(ibmcloud is floating-ips --output json | jq -r '.[] | select(.name=="h100-fip") | .address')
+```
+
+### Lost Track of Interfaces
+
+```bash
+ibmcloud is cluster-network-interfaces $CN_ID --output json | \
+  jq -r '.[] | select(.name | startswith("h100-gpu-rail")) | "\(.name) | \(.id)"'
+```
+
+### Cluster Network Subnet Creation Returns Error
+
+The `hopper-1` profile uses `--total-ipv4-address-count 16384` (not a CIDR). If you get a validation error, check that `CN_ID` is set and the cluster network is `stable`.
 
 ---
 
@@ -995,16 +706,14 @@ This phase will:
 - Join the H100 instance to the OpenShift cluster
 - Approve Certificate Signing Requests (CSRs)
 - Apply appropriate labels to the worker node
-- Takes approximately 30-60 minutes
 
 **Before proceeding**, ensure:
 - H100 instance is running
 - All 8 cluster network attachments are stable
 - OpenShift cluster is healthy (3 masters Ready)
-- You have cluster admin access via oc CLI
 
 ---
 
-**Phase 3 Complete! ✅**
+**Phase 3 Complete!**
 
-**H100 instance provisioned with RDMA networks. Costs now accruing (~$30-40/hour).**
+**Cluster network created, H100 instance provisioned with RDMA. Costs accruing (~$30-40/hour).**
