@@ -2,47 +2,34 @@
 
 ## Overview
 
-This phase integrates the H100 GPU instance as an OpenShift worker node using the Certificate Signing Request (CSR) approval workflow.
+This phase integrates the H100 GPU instance as an OpenShift worker node by approving Certificate Signing Requests (CSRs) and applying labels.
 
 **What You'll Accomplish:**
-- Understand the integration challenge
-- Monitor for Certificate Signing Requests from the H100
-- Approve bootstrap and serving CSRs
-- Verify node joins the cluster
-- Apply GPU, RDMA, and workload labels to the node
-- Verify node is Ready and properly configured
+- Approve bootstrap and serving CSRs from the H100
+- Verify the node joins the cluster and becomes Ready
+- Apply GPU, RDMA, and workload labels
+- Verify cluster health with 4 nodes
 
-**Estimated Time**: 30-60 minutes
+**Estimated Time**: 10-15 minutes
 
-**Complexity**: ⚠️ **HIGH** - This is the most complex phase
+## How It Works
 
-## Why This is Complex
+The H100 was created in Phase 3 with `--user-data @worker.ign` (RHCOS worker ignition config). This ignition config:
+- Configures kubelet to join the OpenShift cluster
+- Includes the SSH public key (from `install-config.yaml` sshKey field)
+- Starts kubelet automatically on boot
 
-The H100 instance was provisioned **outside** of OpenShift's standard MachineSet workflow. Additionally:
+When kubelet starts, it generates CSRs requesting permission to join the cluster. We approve these CSRs, and the node joins automatically. There are two rounds:
 
-1. **Cluster network attachment** required the instance to be STOPPED during attachment
-2. **Non-standard integration** - Can't use standard IPI-managed or MachineSet automation
-3. **Manual CSR approval** - Worker must request certificates, which we approve manually
-4. **Two-step approval** - Bootstrap CSR, then serving CSR (after node joins)
-
-## Integration Approach
-
-We use OpenShift's **Certificate Signing Request (CSR) approval workflow**:
-
-1. **H100 generates CSR** - Worker attempts to join cluster, requests certificates
-2. **We approve bootstrap CSR** - Allows worker to join cluster
-3. **Node appears in cluster** - Shows up in `oc get nodes`
-4. **We approve serving CSR** - Allows kubelet to serve metrics/logs
-5. **Apply labels** - Tag node for GPU, RDMA, workload targeting
+1. **Bootstrap CSR** — kubelet requests client certificate to join
+2. **Serving CSR** — kubelet requests server certificate for metrics/logs
 
 ## Pre-Flight Checks
 
 Before starting, ensure Phases 1-3 are complete:
 
-- [ ] OpenShift cluster deployed (Phase 2)
-- [ ] 3 master nodes Ready
-- [ ] H100 instance created and running (Phase 3)
-- [ ] 8 cluster network interfaces attached
+- [ ] OpenShift cluster deployed (Phase 2) — 3 masters Ready
+- [ ] H100 instance running (Phase 3) — with 8 cluster network attachments
 - [ ] Environment file loaded: `source ~/.ibmcloud-h100-env`
 - [ ] KUBECONFIG set and working
 
@@ -53,6 +40,7 @@ source ~/.ibmcloud-h100-env
 ```
 
 ```bash
+export KUBECONFIG=$HOME/ocp-h100-upi-install/auth/kubeconfig
 oc get nodes
 ```
 
@@ -64,348 +52,183 @@ ibmcloud is instance $H100_INSTANCE_ID --output json | jq -r '.status'
 
 Should show: `running`
 
-```bash
-ibmcloud is instance-cluster-network-attachments $H100_INSTANCE_ID --output json | jq '. | length'
-```
-
-Should show: `8`
-
----
-
-## Understanding Worker Join Methods
-
-There are two approaches to join the H100 to OpenShift:
-
-### Option A: RHCOS with Ignition (Recommended)
-
-If the H100 is running RHCOS (Red Hat Enterprise Linux CoreOS):
-- Use ignition file for automated configuration
-- Most native to OpenShift
-- **Requires**: Recreating the instance with ignition (loses cluster network attachments)
-
-**Status**: Not practical for our case due to cluster network attachment requirement.
-
-### Option B: Manual CSR Approval (What We'll Do)
-
-The worker node attempts to join OpenShift:
-- Generates bootstrap CSR
-- We approve it manually
-- Node joins cluster
-- Generates serving CSR
-- We approve it manually
-- Node becomes fully functional
-
-**This is the approach we'll use.**
-
 ---
 
 ## Step-by-Step Instructions
 
 ### Step 1: Load Environment and Verify Access
 
-Load environment:
-
 ```bash
 source ~/.ibmcloud-h100-env
+export KUBECONFIG=$HOME/ocp-h100-upi-install/auth/kubeconfig
+```
+
+Verify key variables are set:
+
+```bash
+echo "H100_INSTANCE_ID: $H100_INSTANCE_ID"
+echo "OCP_SG_ID:        $OCP_SG_ID"
+```
+
+If any are empty, recover them:
+
+```bash
+[ -z "$H100_INSTANCE_ID" ] && export H100_INSTANCE_ID=$(ibmcloud is instances --output json | jq -r '.[] | select(.name=="ocp-gpu-worker-h100") | .id') && sed -i '' "s/^export H100_INSTANCE_ID=.*/export H100_INSTANCE_ID=$H100_INSTANCE_ID/" ~/.ibmcloud-h100-env
+[ -z "$OCP_SG_ID" ] && export OCP_SG_ID=$(ibmcloud is security-groups --output json | jq -r '.[] | select(.name=="ocp-h100-cluster-sg") | .id') && sed -i '' "s/^export OCP_SG_ID=.*/export OCP_SG_ID=$OCP_SG_ID/" ~/.ibmcloud-h100-env
 ```
 
 Verify cluster access:
 
 ```bash
-export KUBECONFIG=~/ocp-h100-ipi-install/auth/kubeconfig
-```
-
-```bash
 oc whoami
 ```
 
-**Expected**: `system:admin` or `kube:admin`
-
-Test cluster connectivity:
-
-```bash
-oc cluster-info
-```
-
-Should show Kubernetes control plane URL.
+**Expected**: `system:admin`
 
 ---
 
-### Step 2: Get Current Cluster State
-
-#### 2a. List Current Nodes
+### Step 2: Verify Cluster State
 
 ```bash
 oc get nodes
 ```
 
-**Expected Output:**
+**Expected:**
 ```
-NAME                                         STATUS   ROLES                  AGE   VERSION
-ocp-h100-cluster-xxxxx-master-0              Ready    control-plane,master   Xh    v1.x.x
-ocp-h100-cluster-xxxxx-master-1              Ready    control-plane,master   Xh    v1.x.x
-ocp-h100-cluster-xxxxx-master-2              Ready    control-plane,master   Xh    v1.x.x
-```
-
-Note the node count:
-
-```bash
-export INITIAL_NODE_COUNT=$(oc get nodes --no-headers | wc -l | tr -d ' ')
-echo "Initial node count: $INITIAL_NODE_COUNT"
+NAME           STATUS   ROLES                         AGE   VERSION
+ocp-master-0   Ready    control-plane,master,worker   Xh    v1.32.x
+ocp-master-1   Ready    control-plane,master,worker   Xh    v1.32.x
+ocp-master-2   Ready    control-plane,master,worker   Xh    v1.32.x
 ```
 
-Should be: `3`
-
-#### 2b. Check for Existing Worker Nodes
-
-```bash
-oc get nodes -l node-role.kubernetes.io/worker
-```
-
-**Expected**: No resources found (we haven't added workers yet)
+3 masters, all Ready.
 
 ---
 
-### Step 3: Get H100 Instance Information
+### Step 3: Check for Pending CSRs
 
-Get the H100 private IP:
-
-```bash
-export H100_PRIVATE_IP=$(ibmcloud is instance $H100_INSTANCE_ID --output json | jq -r '.primary_network_interface.primary_ip.address')
-echo "H100 Private IP: $H100_PRIVATE_IP"
-```
-
-Get cluster API endpoint:
-
-```bash
-export CLUSTER_API=$(oc whoami --show-server)
-echo "Cluster API: $CLUSTER_API"
-```
-
----
-
-### Step 4: Understand the CSR Workflow
-
-**What happens when H100 tries to join:**
-
-1. **H100 kubelet starts** (either automatically or manually configured)
-2. **Generates bootstrap CSR** - Requests permission to join cluster
-3. **CSR appears in cluster** - Visible via `oc get csr`
-4. **CSR status: Pending** - Waiting for admin approval
-5. **We approve CSR** - Using `oc adm certificate approve`
-6. **Kubelet gets certificate** - Can now join cluster
-7. **Node appears** - Shows in `oc get nodes`
-8. **Generates serving CSR** - Requests permission to serve metrics/logs
-9. **We approve serving CSR** - Node becomes fully functional
-
-**Our task**: Monitor for CSRs and approve them.
-
----
-
-### Step 5: Check for Pending CSRs
-
-#### 5a. List All CSRs
+The H100 kubelet (started automatically by RHCOS + worker.ign) generates CSRs when it boots.
 
 ```bash
 oc get csr
 ```
 
-**Expected Output** (if H100 hasn't started join process):
+**Expected**: One or more CSRs with `Pending` condition:
+
 ```
-No resources found
+NAME        AGE   SIGNERNAME                                    REQUESTOR                                                                   CONDITION
+csr-xxxxx   Xm    kubernetes.io/kube-apiserver-client-kubelet   system:serviceaccount:openshift-machine-config-operator:node-bootstrapper   Pending
 ```
 
-Or may show some old CSRs in Approved state.
-
-#### 5b. Check for Pending CSRs Specifically
+If no pending CSRs, the H100 may still be booting (RHCOS with cluster networks takes 10-15 minutes). Wait and retry:
 
 ```bash
-oc get csr | grep Pending
+sleep 60 && oc get csr | grep Pending
 ```
-
-**If output is empty**: No pending CSRs yet. H100 hasn't started the join process.
-
-**If CSRs shown**: H100 is already trying to join! Skip to Step 6.
 
 ---
 
-### Step 5c: If No CSRs - Troubleshooting
+### Step 4: Approve Bootstrap CSR (First Round)
 
-**If no CSRs appear, possible reasons:**
-
-1. **H100 kubelet not started/configured** - The instance needs kubelet configured to join
-2. **Network connectivity issue** - H100 can't reach cluster API
-3. **No join credentials** - H100 doesn't have bootstrap token/kubeconfig
-
-**For this deployment:**
-
-The H100 instance was created with a basic image. It likely needs manual configuration to join OpenShift.
-
-**Two approaches:**
-
-**A. Wait for automatic join** (if image has cloud-init or ignition):
-- Some images auto-detect OpenShift cluster
-- May take 10-20 minutes
-- Monitor CSRs: `watch oc get csr`
-
-**B. Manual configuration** (advanced):
-- SSH to H100 instance
-- Configure kubelet with cluster bootstrap token
-- Start kubelet service
-- CSRs should appear within 1-2 minutes
-
-**For this manual guide, we'll assume approach A.**
-
----
-
-### Step 6: Monitor for CSRs (Automated Waiting)
-
-Set up a watch to monitor for new CSRs:
+Approve all pending CSRs:
 
 ```bash
-watch -n 10 'oc get csr | grep -E "NAME|Pending"'
-```
-
-This will refresh every 10 seconds and show pending CSRs.
-
-**Keep this running in your terminal.**
-
-**What to look for:**
-```
-NAME        AGE   SIGNERNAME                            REQUESTOR                     CONDITION
-csr-xxxxx   Xs    kubernetes.io/kube-apiserver-client...  system:bootstrap:xxxxx       Pending
-```
-
-**When you see a Pending CSR**, press `Ctrl+C` and proceed to Step 7.
-
-**If no CSRs after 10 minutes:**
-
-The H100 instance likely needs manual configuration. See "Advanced: Manual H100 Configuration" section at the end of this guide.
-
----
-
-### Step 7: Review Pending CSRs
-
-List all pending CSRs:
-
-```bash
-oc get csr | grep Pending
-```
-
-**Expected Output:**
-```
-csr-xxxxx   Xs    kubernetes.io/kube-apiserver-client...  system:bootstrap:xxxxx       Pending
-```
-
-Get details of the CSR:
-
-```bash
-export PENDING_CSR=$(oc get csr --no-headers | grep Pending | head -1 | awk '{print $1}')
-echo "Pending CSR: $PENDING_CSR"
-```
-
-View CSR details:
-
-```bash
-oc describe csr $PENDING_CSR
-```
-
-Look for:
-- **Requestor**: Should be `system:bootstrap:...` or similar
-- **Usages**: Should include client auth
-- **Status**: Pending
-
-**Verify this is legitimate** - it should be from the H100 worker attempting to join.
-
----
-
-### Step 8: Approve Bootstrap CSR
-
-⚠️ **IMPORTANT**: Only approve CSRs you trust. CSRs grant cluster access.
-
-**In our case:** This should be from our H100 worker, which is safe to approve.
-
-Approve the CSR:
-
-```bash
-oc adm certificate approve $PENDING_CSR
-```
-
-**Expected Output:**
-```
-certificatesigningrequest.certificates.k8s.io/csr-xxxxx approved
-```
-
-Verify it's approved:
-
-```bash
-oc get csr $PENDING_CSR
+oc get csr --no-headers | grep Pending | awk '{print $1}' | xargs oc adm certificate approve
 ```
 
 **Expected:**
 ```
-NAME        AGE   SIGNERNAME     REQUESTOR     CONDITION
-csr-xxxxx   Xm    ...            ...           Approved,Issued
+certificatesigningrequest.certificates.k8s.io/csr-xxxxx approved
 ```
 
-Status should show: `Approved,Issued`
+Verify:
+
+```bash
+oc get csr
+```
+
+Should show `Approved,Issued`.
 
 ---
 
-### Step 9: Wait for Node to Join
+### Step 5: Wait for Node to Appear
 
-After approving the bootstrap CSR, the node should join within 1-2 minutes.
-
-Monitor nodes:
+After approving the bootstrap CSR, the node joins within 1-2 minutes:
 
 ```bash
-watch -n 5 'oc get nodes'
+oc get nodes
 ```
 
-**Expected progression:**
-```
-# Initially: 3 nodes (masters only)
-NAME                                         STATUS   ROLES                  AGE   VERSION
-ocp-h100-cluster-xxxxx-master-0              Ready    control-plane,master   Xh    v1.x.x
-ocp-h100-cluster-xxxxx-master-1              Ready    control-plane,master   Xh    v1.x.x
-ocp-h100-cluster-xxxxx-master-2              Ready    control-plane,master   Xh    v1.x.x
+**Expected** — a 4th node appears:
 
-# After 1-2 minutes: 4 nodes (3 masters + 1 worker)
-NAME                                         STATUS     ROLES                  AGE   VERSION
-ocp-h100-cluster-xxxxx-master-0              Ready      control-plane,master   Xh    v1.x.x
-ocp-h100-cluster-xxxxx-master-1              Ready      control-plane,master   Xh    v1.x.x
-ocp-h100-cluster-xxxxx-master-2              Ready      control-plane,master   Xh    v1.x.x
-ocp-h100-worker                              NotReady   worker                 Xs    v1.x.x
+```
+NAME                   STATUS     ROLES                         AGE   VERSION
+ocp-master-0           Ready      control-plane,master,worker   Xh    v1.32.x
+ocp-master-1           Ready      control-plane,master,worker   Xh    v1.32.x
+ocp-master-2           Ready      control-plane,master,worker   Xh    v1.32.x
+ocp-gpu-worker-h100    NotReady   worker                        Xs    v1.32.x
 ```
 
-**Note:** New node will likely show `NotReady` initially. This is normal.
+`NotReady` is normal at this stage — the serving CSR hasn't been approved yet.
 
-When you see the 4th node, press `Ctrl+C`.
+If the node doesn't appear after 2 minutes, check for more pending CSRs and approve them:
+
+```bash
+oc get csr --no-headers | grep Pending | awk '{print $1}' | xargs oc adm certificate approve
+```
 
 ---
 
-### Step 10: Get Worker Node Name
+### Step 6: Approve Serving CSR (Second Round)
 
-List worker nodes:
-
-```bash
-oc get nodes -l node-role.kubernetes.io/worker
-```
-
-**Expected Output:**
-```
-NAME              STATUS     ROLES    AGE   VERSION
-ocp-h100-worker   NotReady   worker   Xs    v1.x.x
-```
-
-Save the node name:
+After the node joins, kubelet generates a serving CSR. Wait 30 seconds:
 
 ```bash
-export H100_NODE_NAME=$(oc get nodes -l node-role.kubernetes.io/worker --no-headers | awk '{print $1}')
-echo "H100 Node Name: $H100_NODE_NAME"
+sleep 30
+oc get csr --no-headers | grep Pending
 ```
 
-**If empty**, the worker role label might not be applied yet. Get all non-master nodes:
+If pending CSRs exist, approve them:
+
+```bash
+oc get csr --no-headers | grep Pending | awk '{print $1}' | xargs oc adm certificate approve
+```
+
+Verify all CSRs are approved:
+
+```bash
+oc get csr --no-headers | grep -v Approved
+```
+
+Should return nothing (all approved).
+
+---
+
+### Step 7: Wait for Node Ready
+
+```bash
+oc get nodes
+```
+
+**Expected** — all 4 nodes Ready:
+
+```
+NAME                   STATUS   ROLES                         AGE   VERSION
+ocp-master-0           Ready    control-plane,master,worker   Xh    v1.32.x
+ocp-master-1           Ready    control-plane,master,worker   Xh    v1.32.x
+ocp-master-2           Ready    control-plane,master,worker   Xh    v1.32.x
+ocp-gpu-worker-h100    Ready    worker                        Xm    v1.32.x
+```
+
+If the node stays `NotReady` for more than 5 minutes, check node conditions:
+
+```bash
+oc describe node ocp-gpu-worker-h100 | grep -A 5 "Conditions:"
+```
+
+---
+
+### Step 8: Save Node Name to Environment
 
 ```bash
 export H100_NODE_NAME=$(oc get nodes --no-headers | grep -v master | awk '{print $1}')
@@ -415,183 +238,27 @@ echo "H100 Node Name: $H100_NODE_NAME"
 Save to environment file:
 
 ```bash
-echo "" >> ~/.ibmcloud-h100-env
-echo "# H100 Worker Node (joined $(date))" >> ~/.ibmcloud-h100-env
-echo "export H100_NODE_NAME=$H100_NODE_NAME" >> ~/.ibmcloud-h100-env
+sed -i '' "s/^export H100_NODE_NAME=.*/export H100_NODE_NAME=$H100_NODE_NAME/" ~/.ibmcloud-h100-env
+source ~/.ibmcloud-h100-env
 ```
 
 ---
 
-### Step 11: Check for Additional Pending CSRs
+### Step 9: Apply Labels
 
-After the node joins, it will generate **serving CSRs** for kubelet metrics and logs.
-
-Wait 30 seconds:
-
-```bash
-sleep 30
-```
-
-Check for new pending CSRs:
-
-```bash
-oc get csr | grep Pending
-```
-
-**If pending CSRs exist:**
-
-These are likely the serving CSRs. List them:
-
-```bash
-oc get csr --no-headers | grep Pending
-```
-
-Approve all pending CSRs:
-
-```bash
-oc get csr --no-headers | grep Pending | awk '{print $1}' | xargs oc adm certificate approve
-```
-
-**Expected Output:**
-```
-certificatesigningrequest.certificates.k8s.io/csr-xxxxx approved
-certificatesigningrequest.certificates.k8s.io/csr-yyyyy approved
-```
-
-Verify all are approved:
-
-```bash
-oc get csr | grep -v Approved
-```
-
-Should only show the header line (all CSRs approved).
-
-**If no pending CSRs:**
-
-They may appear in 1-2 minutes. Check again:
-
-```bash
-sleep 60
-oc get csr | grep Pending
-```
-
-If still none, the node may be using a different configuration. Proceed to Step 12.
-
----
-
-### Step 12: Wait for Node to Become Ready
-
-Monitor node status:
-
-```bash
-watch -n 10 "oc get node $H100_NODE_NAME"
-```
-
-**Expected progression:**
-```
-# Initially
-NAME              STATUS     ROLES    AGE   VERSION
-ocp-h100-worker   NotReady   worker   Xm    v1.x.x
-
-# After 2-5 minutes
-NAME              STATUS   ROLES    AGE   VERSION
-ocp-h100-worker   Ready    worker   Xm    v1.x.x
-```
-
-**Why NotReady?**
-- CNI (network plugin) still initializing
-- Container runtime starting
-- Node components configuring
-
-**Typical time**: 2-5 minutes to reach Ready
-
-Once STATUS shows `Ready`, press `Ctrl+C` and proceed.
-
----
-
-### Step 13: Verify Node Details
-
-Get detailed node information:
-
-```bash
-oc describe node $H100_NODE_NAME
-```
-
-**Check for:**
-- **Status: Ready**
-- **Roles: worker**
-- **Internal IP**: Should match H100 private IP
-- **OS Image**: RHCOS or RHEL
-- **Container Runtime**: CRI-O
-
-View node conditions:
-
-```bash
-oc get node $H100_NODE_NAME -o jsonpath='{.status.conditions[*].type}' | tr ' ' '\n'
-```
-
-**Expected:**
-```
-Ready
-MemoryPressure
-DiskPressure
-PIDPressure
-```
-
-Check all are healthy:
-
-```bash
-oc get node $H100_NODE_NAME -o jsonpath='{range .status.conditions[*]}{.type}{"\t"}{.status}{"\n"}{end}'
-```
-
-**Expected:**
-```
-Ready                True
-MemoryPressure       False
-DiskPressure         False
-PIDPressure          False
-```
-
----
-
-### Step 14: Apply Labels to H100 Node
-
-Now we'll apply labels for GPU, RDMA, and workload targeting.
-
-#### 14a. View Current Labels
-
-```bash
-oc get node $H100_NODE_NAME --show-labels
-```
-
-Shows all current labels (very long output).
-
-#### 14b. Apply Worker Role Label (if not present)
-
-Check if worker role label exists:
-
-```bash
-oc get node $H100_NODE_NAME -o jsonpath='{.metadata.labels.node-role\.kubernetes\.io/worker}'
-```
-
-If empty, apply it:
+#### 9a. Apply Worker Role Label (if not present)
 
 ```bash
 oc label node $H100_NODE_NAME node-role.kubernetes.io/worker="" --overwrite
 ```
 
-#### 14c. Apply GPU Role Label
+#### 9b. Apply GPU Role Label
 
 ```bash
 oc label node $H100_NODE_NAME node-role.kubernetes.io/gpu=true --overwrite
 ```
 
-**Expected:**
-```
-node/ocp-h100-worker labeled
-```
-
-#### 14d. Apply NVIDIA-Specific Labels
+#### 9c. Apply NVIDIA-Specific Labels
 
 ```bash
 oc label node $H100_NODE_NAME \
@@ -601,12 +268,7 @@ oc label node $H100_NODE_NAME \
     --overwrite
 ```
 
-**Expected:**
-```
-node/ocp-h100-worker labeled
-```
-
-#### 14e. Apply RDMA Labels
+#### 9d. Apply RDMA Labels
 
 ```bash
 oc label node $H100_NODE_NAME \
@@ -616,12 +278,7 @@ oc label node $H100_NODE_NAME \
     --overwrite
 ```
 
-**Expected:**
-```
-node/ocp-h100-worker labeled
-```
-
-#### 14f. Apply IBM Cloud Labels
+#### 9e. Apply IBM Cloud Labels
 
 ```bash
 oc label node $H100_NODE_NAME \
@@ -631,12 +288,7 @@ oc label node $H100_NODE_NAME \
     --overwrite
 ```
 
-**Expected:**
-```
-node/ocp-h100-worker labeled
-```
-
-#### 14g. Apply Workload Type Labels
+#### 9f. Apply Workload Type Labels
 
 ```bash
 oc label node $H100_NODE_NAME \
@@ -645,169 +297,89 @@ oc label node $H100_NODE_NAME \
     --overwrite
 ```
 
-**Expected:**
+---
+
+### Step 10: Verify Labels
+
+```bash
+oc get node $H100_NODE_NAME -o jsonpath='{.metadata.labels}' | jq 'with_entries(select(.key | contains("nvidia") or contains("rdma") or contains("gpu") or contains("workload")))'
 ```
-node/ocp-h100-worker labeled
+
+**Expected** — should show all GPU, RDMA, and workload labels:
+
+```json
+{
+  "ibm-cloud.kubernetes.io/cluster-network": "rdma-cluster",
+  "ibm-cloud.kubernetes.io/cluster-network-profile": "hopper-1",
+  "ibm-cloud.kubernetes.io/rdma": "enabled",
+  "node-role.kubernetes.io/gpu": "true",
+  "nvidia.com/gpu.count": "8",
+  "nvidia.com/gpu.memory": "80GB",
+  "nvidia.com/gpu.product": "H100-SXM5",
+  "workload.openshift.io/ai-ml": "true",
+  "workload.openshift.io/hpc": "true"
+}
 ```
 
 ---
 
-### Step 15: Verify Labels Applied
+### Step 11: Final Verification
 
-Check all GPU-related labels:
-
-```bash
-oc get node $H100_NODE_NAME -o jsonpath='{.metadata.labels}' | jq '.'
-```
-
-This will show all labels in JSON format.
-
-**Verify these are present:**
-- `node-role.kubernetes.io/gpu: "true"`
-- `nvidia.com/gpu.product: "H100-SXM5"`
-- `nvidia.com/gpu.count: "8"`
-- `ibm-cloud.kubernetes.io/rdma: "enabled"`
-- `ibm-cloud.kubernetes.io/cluster-network: "rdma-cluster"`
-- `workload.openshift.io/ai-ml: "true"`
-
-Check specific labels:
-
-```bash
-oc get node $H100_NODE_NAME -o jsonpath='{.metadata.labels.node-role\.kubernetes\.io/gpu}'
-```
-
-Should output: `true`
-
-```bash
-oc get node $H100_NODE_NAME -o jsonpath='{.metadata.labels.nvidia\.com/gpu\.count}'
-```
-
-Should output: `8`
-
----
-
-### Step 16: Optional - Apply Taints (GPU Exclusivity)
-
-**What are taints?**
-
-Taints prevent regular workloads from scheduling on GPU nodes. Only pods with matching tolerations can schedule.
-
-**When to use:**
-- Reserve GPU nodes exclusively for GPU workloads
-- Prevent CPU-only pods from consuming GPU node resources
-- Cost optimization (GPU nodes are expensive)
-
-**Apply GPU taint:**
-
-```bash
-oc adm taint node $H100_NODE_NAME nvidia.com/gpu=present:NoSchedule
-```
-
-**Expected:**
-```
-node/ocp-h100-worker tainted
-```
-
-**To remove taint later:**
-
-```bash
-oc adm taint node $H100_NODE_NAME nvidia.com/gpu:NoSchedule-
-```
-
-**For now, we'll skip taints** to allow easier testing. You can apply later if desired.
-
----
-
-### Step 17: Final Node Verification
-
-#### 17a. Get Node Status Summary
+#### 11a. All Nodes Ready
 
 ```bash
 oc get nodes
 ```
 
-**Expected Output:**
-```
-NAME                                         STATUS   ROLES                  AGE   VERSION
-ocp-h100-cluster-xxxxx-master-0              Ready    control-plane,master   Xh    v1.x.x
-ocp-h100-cluster-xxxxx-master-1              Ready    control-plane,master   Xh    v1.x.x
-ocp-h100-cluster-xxxxx-master-2              Ready    control-plane,master   Xh    v1.x.x
-ocp-h100-worker                              Ready    gpu,worker             Xm    v1.x.x
-```
+4 nodes, all Ready.
 
-Verify:
-- 4 nodes total (3 masters + 1 worker)
-- All show `STATUS: Ready`
-- Worker shows roles: `gpu,worker`
-
-#### 17b. Get Node Resource Capacity
+#### 11b. Node Resource Capacity
 
 ```bash
-oc describe node $H100_NODE_NAME | grep -A 20 "Capacity:"
+oc describe node $H100_NODE_NAME | grep -A 10 "Capacity:"
 ```
 
 **Look for:**
 - `cpu:` 160 (160 vCPUs)
 - `memory:` ~1.75Ti
-- `pods:` 250 (default pod limit)
 
-**Note:** GPU resources won't show yet. They appear after GPU Operator installation (Phase 6).
+> GPU resources (`nvidia.com/gpu: 8`) will NOT appear until GPU Operator is installed (Phase 6).
 
-#### 17c. Check Node Networking
-
-View network interfaces:
+#### 11c. Cluster Operators Healthy
 
 ```bash
-oc debug node/$H100_NODE_NAME -- ip addr show
+oc get co | grep -v "True.*False.*False" | grep -v "^NAME"
 ```
 
-This opens a debug pod on the node and shows network interfaces.
+Should return nothing (all healthy). Some operators may show `PROGRESSING: True` briefly after adding a worker — wait 5 minutes and check again.
 
-**Look for:**
-- Primary interface (VPC management network)
-- Additional interfaces (cluster network/RDMA - may not be visible yet)
-
-Type `exit` to leave the debug session.
-
----
-
-### Step 18: Verify Cluster Health
-
-#### 18a. Check All Nodes
+#### 11d. CNI Pods Running on H100
 
 ```bash
-oc get nodes
+oc get pods -A -o wide | grep $H100_NODE_NAME | head -10
 ```
 
-All 4 nodes should be Ready.
+Should show pods like `ovnkube-node`, `node-ca`, `multus` — all `Running`.
 
-#### 18b. Check Cluster Operators
+#### 11e. Summary
 
 ```bash
-oc get co
+echo ""
+echo "========================================"
+echo "Phase 4 Complete"
+echo "========================================"
+echo ""
+echo "Nodes:  $(oc get nodes --no-headers | wc -l | tr -d ' ') (expected: 4)"
+echo "Worker: $H100_NODE_NAME"
+echo "Status: $(oc get node $H100_NODE_NAME -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')"
+echo "Roles:  $(oc get node $H100_NODE_NAME -o jsonpath='{.metadata.labels.node-role\.kubernetes\.io/gpu}'  && echo ' gpu') $(oc get node $H100_NODE_NAME -o jsonpath='{.metadata.labels.node-role\.kubernetes\.io/worker}' && echo ' worker')"
+echo "CPU:    $(oc get node $H100_NODE_NAME -o jsonpath='{.status.capacity.cpu}')"
+echo "Memory: $(oc get node $H100_NODE_NAME -o jsonpath='{.status.capacity.memory}')"
+echo ""
+echo "GPU resources: Not yet (Phase 6 — GPU Operator)"
+echo "RDMA networks: Not yet (Phase 5 — RDMA Operators)"
+echo "========================================"
 ```
-
-All cluster operators should show:
-- `AVAILABLE: True`
-- `PROGRESSING: False`
-- `DEGRADED: False`
-
-Some operators may show `PROGRESSING: True` briefly after adding worker. Wait 5-10 minutes and check again.
-
-#### 18c. Check Node Pods
-
-Verify CNI and other node components are running on H100:
-
-```bash
-oc get pods -A -o wide | grep $H100_NODE_NAME
-```
-
-**Should see pods like:**
-- `ovnkube-node-xxxxx` (OVN CNI)
-- `node-ca-xxxxx` (certificate management)
-- `multus-xxxxx` (network plugin)
-
-All should show `STATUS: Running`
 
 ---
 
@@ -815,255 +387,91 @@ All should show `STATUS: Running`
 
 At the end of Phase 4, you should have:
 
-- [x] **H100 node joined cluster** via CSR approval workflow
-- [x] **Bootstrap CSR approved** - Allowed initial join
-- [x] **Serving CSR approved** - Enabled kubelet metrics/logs
-- [x] **Node in Ready state** - Fully functional
-- [x] **GPU labels applied** - `nvidia.com/gpu.*`
-- [x] **RDMA labels applied** - `ibm-cloud.kubernetes.io/rdma=enabled`
-- [x] **Workload labels applied** - `workload.openshift.io/ai-ml=true`
-- [x] **4 total nodes** - 3 masters + 1 H100 worker
+- [x] **H100 node joined cluster** via CSR approval
+- [x] **Bootstrap CSR approved**
+- [x] **Serving CSR approved**
+- [x] **Node in Ready state**
+- [x] **GPU labels applied** (`nvidia.com/gpu.*`)
+- [x] **RDMA labels applied** (`ibm-cloud.kubernetes.io/rdma=enabled`)
+- [x] **Workload labels applied** (`workload.openshift.io/ai-ml=true`)
+- [x] **4 total nodes** — 3 masters + 1 H100 worker
+- [x] **All cluster operators healthy**
 
-### Verify Checklist
+---
+
+## Cost
+
+After Phase 4:
+- **Control Plane**: 3 masters (bx2-8x32) — ~$0.50-1.00/hour
+- **Worker**: 1 H100 (gx3d-160x1792x8h100) — ~$30-40/hour
+- **Total**: ~$30-41/hour
+
+To stop H100 costs temporarily (loses cluster network — must re-attach on restart):
 
 ```bash
-# Should show 4 nodes, all Ready
-oc get nodes
-
-# Should show worker node
-oc get nodes -l node-role.kubernetes.io/gpu
-
-# Should show GPU labels
-oc get node $H100_NODE_NAME -o jsonpath='{.metadata.labels}' | jq 'with_entries(select(.key | contains("nvidia") or contains("rdma")))'
-
-# Should show all operators healthy
-oc get co | grep -v "True.*False.*False" | wc -l
-# Should output: 1 (just the header line)
+ibmcloud is instance-stop $H100_INSTANCE_ID --force
 ```
-
-If all checks pass, Phase 4 is complete!
 
 ---
 
 ## Troubleshooting
 
-### Issue: No CSRs Appearing
+### No CSRs Appearing
 
-**Possible causes:**
-- H100 instance not configured for OpenShift
-- Network connectivity issues
-- Kubelet not started
+The H100 boots RHCOS with worker.ign — CSRs should appear within 1-5 minutes of the instance reaching `running` state. If no CSRs after 10 minutes:
 
-**Diagnosis:**
+1. Verify instance is running:
+   ```bash
+   ibmcloud is instance $H100_INSTANCE_ID --output json | jq -r '.status'
+   ```
 
-Check if H100 can reach cluster API:
+2. SSH to the instance and check kubelet:
+   ```bash
+   ssh -i ~/.ssh/id_rsa core@$H100_FIP "sudo systemctl status kubelet"
+   ```
 
-```bash
-# Get H100 floating IP (if exists)
-FLOATING_IP=$(ibmcloud is instance $H100_INSTANCE_ID --output json | jq -r '.primary_network_interface.floating_ips[0].address // empty')
+3. Check kubelet logs for errors:
+   ```bash
+   ssh -i ~/.ssh/id_rsa core@$H100_FIP "sudo journalctl -u kubelet --no-pager | tail -20"
+   ```
 
-# SSH to H100
-ssh root@$FLOATING_IP
+4. Verify the instance can reach the cluster API internally:
+   ```bash
+   ssh -i ~/.ssh/id_rsa core@$H100_FIP "curl -sk https://api-int.ocp-h100-cluster.ibmc.kni.syseng.devcluster.openshift.com:6443/version"
+   ```
 
-# From H100, test cluster API
-curl -k $CLUSTER_API/version
-```
+### Node Stays NotReady
 
-Should return JSON with cluster version.
-
-### Issue: CSRs Appear But Node Doesn't Join
-
-**Check:**
-- CSR was actually approved: `oc get csr`
-- Node may need time: wait 5 minutes
-- Check kubelet logs on H100 (if SSH access available)
-
-### Issue: Node Stays NotReady
-
-**Common causes:**
-- CNI not initialized
-- Container runtime issues
-- Network plugin problems
-
-**Diagnosis:**
+Check node conditions:
 
 ```bash
-oc describe node $H100_NODE_NAME
+oc describe node $H100_NODE_NAME | grep -A 5 "Conditions:"
 ```
 
-Look at "Conditions" section for specific errors.
+Common causes:
+- CNI not initialized — wait 2-5 minutes
+- Additional CSRs pending — approve them: `oc get csr --no-headers | grep Pending | awk '{print $1}' | xargs oc adm certificate approve`
 
-Check node pods:
+### Multiple CSRs Accumulate
 
-```bash
-oc get pods -A -o wide | grep $H100_NODE_NAME
-```
-
-If CNI pods are not Running, that's the issue.
-
-### Issue: Labels Not Applied
-
-**Verify:**
-
-```bash
-oc get node $H100_NODE_NAME --show-labels | grep nvidia
-```
-
-If empty, re-run label commands from Step 14.
-
-**Force label:**
-
-```bash
-oc label node $H100_NODE_NAME nvidia.com/gpu.count=8 --overwrite=true
-```
-
-### Issue: Multiple Pending CSRs
-
-If many CSRs accumulate:
-
-**Approve all at once:**
+If many CSRs pile up (e.g., from instance restarts), approve all at once:
 
 ```bash
 oc get csr --no-headers | grep Pending | awk '{print $1}' | xargs oc adm certificate approve
 ```
 
-Then verify:
-
-```bash
-oc get csr
-```
-
----
-
-## Advanced: Manual H100 Configuration
-
-**If CSRs never appear**, the H100 instance may need manual kubelet configuration.
-
-This requires:
-1. SSH access to H100
-2. OpenShift bootstrap token
-3. Manual kubelet configuration
-
-**Steps (high-level):**
-
-1. Generate bootstrap token on cluster
-2. SSH to H100
-3. Install/configure CRI-O
-4. Install/configure kubelet
-5. Create kubelet configuration with bootstrap token
-6. Start kubelet service
-7. CSRs should appear
-
-This is advanced and beyond the scope of this manual guide. See OpenShift documentation for "Adding RHEL nodes to cluster."
-
----
-
-## Important Notes
-
-### Total Cluster Status
-
-After Phase 4:
-- **Control Plane**: 3 masters (bx2-8x32) - ~$0.50-1.00/hour
-- **Workers**: 1 H100 (gx3d-160x1792x8h100) - ~$30-40/hour
-- **Total Cost**: ~$30-41/hour
-
-### GPU Resources Not Yet Available
-
-**Important:** Even though the H100 has 8 GPUs, they won't show as Kubernetes resources yet:
-
-```bash
-oc describe node $H100_NODE_NAME | grep nvidia.com/gpu
-```
-
-Will show nothing.
-
-**Why?** GPU Operator is not installed yet. This happens in Phase 6.
-
-### RDMA Networks Not Yet Configured
-
-The 8 cluster network interfaces are attached, but not yet configured for pod networking:
-
-```bash
-oc get network-attachment-definitions -A
-```
-
-Will show nothing or only default networks.
-
-**Why?** RDMA operators (SR-IOV, NVIDIA Network) not installed yet. This happens in Phase 5.
-
-### What We Have Now
-
-- ✅ Worker node joined and Ready
-- ✅ Can schedule regular pods
-- ✅ Labels in place for future operator targeting
-- ❌ GPUs not yet usable (need GPU Operator)
-- ❌ RDMA not yet configured (need RDMA operators)
-
 ---
 
 ## Next Steps
 
-**Phases 5-7 are not covered in these manual guides.** Use the automated scripts:
+After Phase 4 completes:
 
-### Phase 5: RDMA Operators (30-40 min)
-
-```bash
-cd ../deployment-scripts/phase5-rdma-operators/
-./01-install-nfd.sh
-./02-install-nmstate.sh
-./03-install-sriov.sh
-./04-install-nvidia-network-operator.sh
-./05-configure-sriov-rdma.sh
-./06-verify-rdma-resources.sh
-```
-
-### Phase 6: GPU Operator (20-30 min)
-
-```bash
-cd ../deployment-scripts/phase6-gpu-operator/
-./01-install-gpu-operator.sh
-./02-create-cluster-policy.sh
-./03-verify-gpu-resources.sh
-```
-
-### Phase 7: Validation (15-20 min)
-
-```bash
-cd ../deployment-scripts/phase7-validation/
-./01-verify-cluster-health.sh
-./02-test-rdma.sh
-./03-test-gpu.sh
-./04-test-nccl-optional.sh
-```
-
-### After All Phases Complete
-
-You'll have:
-- ✅ Functional OpenShift cluster with H100 worker
-- ✅ 8× H100 GPUs available as Kubernetes resources (`nvidia.com/gpu`)
-- ✅ 8× RDMA interfaces configured (`rdma/rdma_mlx5`)
-- ✅ GPU Direct RDMA enabled
-- ✅ Ready for AI/ML workloads (PyTorch, TensorFlow, etc.)
-
-See `../deployment-scripts/docs/POST-DEPLOYMENT.md` for workload examples.
+1. **Phase 5**: Install RDMA Operators (NFD, NMState, SR-IOV, NVIDIA Network)
+2. **Phase 6**: Install GPU Operator (NVIDIA GPU Operator, ClusterPolicy)
+3. **Phase 7**: Validate (RDMA test, GPU test, optional NCCL benchmark)
 
 ---
 
-## Success Criteria
+**Phase 4 Complete!**
 
-Phase 4 is complete when:
-
-- [x] 4 nodes in cluster (3 masters + 1 worker)
-- [x] All nodes show STATUS: Ready
-- [x] H100 node has worker and gpu roles
-- [x] GPU labels present on H100 node
-- [x] RDMA labels present on H100 node
-- [x] All cluster operators Available and not Degraded
-- [x] CNI pods running on H100 node
-- [x] Node can schedule regular pods (test with sample deployment)
-
----
-
-**Phase 4 Complete! ✅**
-
-**H100 successfully joined as OpenShift worker node. Cluster now has 4 nodes (3 masters + 1 H100 worker). Ready for operator installation in Phases 5-6.**
+**H100 joined as OpenShift worker node. 4 nodes total (3 masters + 1 H100). Ready for operator installation.**
