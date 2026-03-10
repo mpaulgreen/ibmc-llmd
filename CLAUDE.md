@@ -78,6 +78,23 @@
 - GPU: `gpu-operator-certified`, Network: `nvidia-network-operator`
 - NFD: `nfd`, RHOAI: `rhods-operator`, cert-manager: `openshift-cert-manager-operator`
 
+### LWS Operator — Meta-Operator Pattern
+- Installing the CSV alone does NOT create the `LeaderWorkerSet` CRD
+- Must create `LeaderWorkerSetOperator` CR (`operator.openshift.io/v1`, name: `cluster`, managementState: `Managed`)
+- Without this, LLMInferenceService fails: `no matches for kind "LeaderWorkerSet" in version "leaderworkerset.x-k8s.io/v1"`
+
+### LLMInferenceService (Phase 6)
+- CRD: `serving.kserve.io/v1alpha1`, provided by RHOAI 3.3
+- Do NOT specify custom `image:` — controller uses RHOAI's `registry.redhat.io/rhaiis/vllm-cuda-rhel9`
+- Do NOT specify `args:` — controller generates a bash startup script; custom args overwrite it
+- Use `VLLM_ADDITIONAL_ARGS` env var for extra vLLM flags (TP, gpu-memory-utilization, etc.)
+- `parallelism.tensor` is metadata only — does NOT inject `--tensor-parallel-size`
+- Controller auto-creates: Deployment, InferencePool, EPP scheduler, HTTPRoute, TLS certs
+- Controller mounts PVC from `pvc://` URI at `/mnt/models` with correct subPath
+- `router.gateway: {}` references default Gateway `openshift-ai-inference` in `openshift-ingress` (must be created manually)
+- RHOAI's `data-science-gateway` restricts `allowedRoutes` via `GatewayConfig` controller — do NOT use it
+- Create `openshift-ai-inference` Gateway with `allowedRoutes.namespaces.from: All`, HTTP port 80
+
 ## Architecture
 
 - **Control Plane**: 3x bx2-8x32 (8 vCPU, 32GB each)
@@ -123,6 +140,8 @@
 | 3 | PHASE3-H100-PROVISIONING.md | 30-45 min | Cluster network + H100 |
 | 4 | PHASE4-WORKER-INTEGRATION.md | 10-15 min | CSR approval + labels |
 | 5 | PHASE5-OPERATORS.md | 45-60 min | GPU, RDMA, AI platform, model serving |
+| 6 | PHASE6-INFERENCE-SCHEDULING.md | 30-45 min | LLMInferenceService (vLLM + EPP + Gateway) |
+| 7 | PHASE7-TIERED-PREFIX-CACHE.md | 15-20 min | CPU prefix cache offloading (add-on) |
 
 ## Infrastructure (Pre-existing, kept across deploys)
 - **SSH Key**: r010-3f6ad86f-6044-48fd-9bf4-b9cca40927b8

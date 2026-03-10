@@ -824,6 +824,44 @@ oc get csv -n openshift-lws-operator
 
 **Expected**: `leader-worker-set.v1.0.0` with phase `Succeeded`.
 
+### 8e. Create LeaderWorkerSetOperator CR
+
+The LWS operator follows the meta-operator pattern — the CSV deploys the operator pod, but the actual LWS controller and `LeaderWorkerSet` CRD are only created when you create the operand CR:
+
+```bash
+oc apply -f - <<EOF
+apiVersion: operator.openshift.io/v1
+kind: LeaderWorkerSetOperator
+metadata:
+  name: cluster
+spec:
+  managementState: Managed
+EOF
+```
+
+### 8f. Wait for LWS CRD
+
+```bash
+echo "Waiting for LeaderWorkerSet CRD..."
+while ! oc get crd leaderworkersets.leaderworkerset.x-k8s.io --no-headers 2>/dev/null | grep -q leaderworkersets; do
+  sleep 5
+  echo -n "."
+done
+echo ""
+echo "LeaderWorkerSet CRD available."
+```
+
+Verify:
+
+```bash
+oc get leaderworkersetoperators.operator.openshift.io cluster \
+  -o jsonpath='Available: {.status.conditions[?(@.type=="Available")].status}'; echo ""
+```
+
+**Expected**: `Available: True`
+
+> **Why this step?** Without the `LeaderWorkerSetOperator` CR, the `LeaderWorkerSet` CRD (`leaderworkerset.x-k8s.io/v1`) does not exist. LLMInferenceService (Phase 6) requires this CRD and will fail with `no matches for kind "LeaderWorkerSet" in version "leaderworkerset.x-k8s.io/v1"` if it's missing.
+
 ---
 
 ## Step 9: Install Red Hat OpenShift AI (RHOAI) 3.0

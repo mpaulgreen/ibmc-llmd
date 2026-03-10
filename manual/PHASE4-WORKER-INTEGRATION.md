@@ -361,7 +361,39 @@ oc get pods -A -o wide | grep $H100_NODE_NAME | head -10
 
 Should show pods like `ovnkube-node`, `node-ca`, `multus` — all `Running`.
 
-#### 11e. Summary
+#### 11e. Verify Pod Egress Connectivity
+
+Pods on the H100 must be able to reach external hosts (e.g., to download ML models from HuggingFace). OVN-Kubernetes may not fully initialize UDP routing on a manually-added worker node, causing DNS resolution failures from pods.
+
+Test external connectivity from a pod scheduled on the H100:
+
+```bash
+oc run egress-test --restart=Never --overrides='{"spec":{"nodeName":"ocp-gpu-worker-h100"}}' --image=registry.access.redhat.com/ubi9/ubi-minimal -- sleep 60
+sleep 15
+oc exec egress-test -- bash -c "curl -sI https://huggingface.co --connect-timeout 10 2>&1 | head -3"
+oc delete pod egress-test
+```
+
+**Expected**: `HTTP/2 200` — pod can reach external hosts.
+
+**If no output or timeout**: DNS resolution from pods on the H100 is broken. Fix by restarting the OVN-Kubernetes node pod on the H100 to reinitialize network flows:
+
+```bash
+oc delete pod -n openshift-ovn-kubernetes -l app=ovnkube-node --field-selector spec.nodeName=ocp-gpu-worker-h100
+```
+
+Wait 60 seconds for the OVN pod to restart (8/8 Running), then retest:
+
+```bash
+sleep 60
+oc get pods -n openshift-ovn-kubernetes --field-selector spec.nodeName=ocp-gpu-worker-h100 --no-headers
+```
+
+Rerun the egress test above. It should now return `HTTP/2 200`.
+
+> **Root cause**: When the H100 joins the cluster via CSR approval, OVN-Kubernetes configures the node's gateway but UDP routing (used by DNS) may not fully initialize. The 8 cluster network interfaces (RDMA) on the H100 add complexity to OVN's network configuration. Restarting the `ovnkube-node` pod forces re-initialization of all OVN flows, fixing the UDP path to CoreDNS.
+
+#### 11f. Summary
 
 ```bash
 echo ""

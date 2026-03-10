@@ -42,8 +42,10 @@ OpenShift 4.19 UPI Cluster
 | **3** | [PHASE3-H100-PROVISIONING.md](PHASE3-H100-PROVISIONING.md) | 30-45 min | Create cluster network, provision H100 |
 | **4** | [PHASE4-WORKER-INTEGRATION.md](PHASE4-WORKER-INTEGRATION.md) | 10-15 min | Join H100 to cluster via CSR approval |
 | **5** | [PHASE5-OPERATORS.md](PHASE5-OPERATORS.md) | 45-60 min | GPU, RDMA, AI platform operators + model serving |
+| **6** | [PHASE6-INFERENCE-SCHEDULING.md](PHASE6-INFERENCE-SCHEDULING.md) | 30-45 min | LLMInferenceService — intelligent inference scheduling |
+| **7** | [PHASE7-TIERED-PREFIX-CACHE.md](PHASE7-TIERED-PREFIX-CACHE.md) | 15-20 min | CPU prefix cache offloading (add-on to Phase 6) |
 
-**Total Time**: 3.5-4.5 hours
+**Total Time**: 4.5-6 hours
 
 ## Phase 5 Operator Stack
 
@@ -113,6 +115,8 @@ manual/
 +-- PHASE3-H100-PROVISIONING.md     # Cluster network + H100 instance
 +-- PHASE4-WORKER-INTEGRATION.md    # Worker node join via CSR approval
 +-- PHASE5-OPERATORS.md             # GPU, RDMA, AI platform operators
++-- PHASE6-INFERENCE-SCHEDULING.md  # llm-d intelligent inference scheduling
++-- PHASE7-TIERED-PREFIX-CACHE.md   # CPU prefix cache offloading
 ```
 
 ## Getting Started
@@ -125,7 +129,7 @@ Start with **[Phase 1: Prerequisites](PHASE1-PREREQUISITES.md)** and proceed seq
 
 ---
 
-**Updated**: 2026-03-09
+**Updated**: 2026-03-10
 **OpenShift Version**: 4.19.24
 **Deployment Method**: UPI (User-Provisioned Infrastructure)
 **Region**: eu-de (Frankfurt), Zone: eu-de-2
