@@ -920,7 +920,28 @@ for plan in $(oc get installplan -n redhat-ods-operator --no-headers | awk '{pri
 done
 ```
 
-### 9f. Wait for Service Mesh Operator
+### 9f. Fix Service Mesh Chain Upgrade (if stuck)
+
+Service Mesh may install via a chain upgrade (e.g., v3.0.8 → v3.1.0 → v3.2.2). The intermediate CSV (v3.1.0) can fail with a CRD migration error (`risk of data loss updating ztunnels.sailoperator.io`), blocking the final version.
+
+Check for stuck intermediate CSVs:
+
+```bash
+oc get csv -n openshift-operators --no-headers | grep servicemesh
+```
+
+If you see an intermediate version in `Pending` or `Failed` alongside the target version, delete the stuck intermediate:
+
+```bash
+# Example: delete stuck v3.1.0 to unblock v3.2.2
+STUCK_CSV=$(oc get csv -n openshift-operators --no-headers | grep servicemesh | grep -v Succeeded | awk '{print $1}' | head -1)
+if [ -n "$STUCK_CSV" ]; then
+  echo "Deleting stuck CSV: $STUCK_CSV"
+  oc delete csv $STUCK_CSV -n openshift-operators
+fi
+```
+
+### 9g. Wait for Service Mesh Operator
 
 ```bash
 echo "Waiting for Service Mesh operator..."
@@ -932,7 +953,7 @@ echo ""
 echo "Service Mesh operator installed."
 ```
 
-### 9g. Verify Both Operators
+### 9h. Verify Both Operators
 
 ```bash
 oc get csv -n redhat-ods-operator

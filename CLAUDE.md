@@ -1,230 +1,145 @@
-# Claude Context: OpenShift IPI + H100 GPU Deployment on IBM Cloud
+# Claude Context: OpenShift UPI + H100 GPU on IBM Cloud VPC
 
-## Project Objective
-Deploy OpenShift 4.20+ using IPI (Installer-Provisioned Infrastructure) on IBM Cloud VPC with H100 GPU worker node and RDMA cluster networks for AI/ML workloads.
+## Project Status: FULLY DEPLOYED AND OPERATIONAL (2026-03-10)
 
-## Critical Constraints
+- OpenShift 4.19.24 UPI cluster running on IBM Cloud VPC (eu-de-2)
+- 4 nodes: 3 masters (bx2-8x32) + 1 H100 worker (gx3d-160x1792x8h100)
+- 8x H100 80GB HBM3 GPUs operational (`nvidia.com/gpu: 8`)
+- 8x RDMA links active (`rdma/rdma_mlx5: 1k`)
+- 11 operators installed and Succeeded
+- KServe model serving stack ready (DataScienceCluster Ready)
+- Cost: ~$30-41/hour while H100 running
 
-### Technology Limitations
-- **OpenShift IPI on IBM Cloud VPC**: Technology Preview (not production-ready, no Red Hat SLA)
-- **Cluster Networks**: Can only be attached to STOPPED instances
-- **Non-Standard Integration**: H100 worker cannot use standard MachineSet workflow due to cluster network requirement
+## What Was Accomplished
 
-### Infrastructure Requirements
-- **Region**: eu-de (Frankfurt)
-- **Zone**: eu-de-2
-- **VPC**: rdma-pvc-eude (r010-39a1b8f9-0c94-4fea-9842-54635fb079e9)
-- **Cluster Network**: rdma-cluster with hopper-1 profile (02c7-20a6fc6c-33f1-461a-b69b-f36f83255022)
-- **8 Cluster Network Subnets**: Pre-provisioned for 8 GPU rails
-- **Management Subnet**: 02c7-67b188b3-1981-4454-bc7b-1417f8cdee5d
-- **Security Group**: r010-25a67700-a8a2-48d4-a837-573734fca8e4
-- **SSH Key**: r010-3f6ad86f-6044-48fd-9bf4-b9cca40927b8
+### Phase 1: Prerequisites
+- Installed IBM Cloud CLI, oc 4.19.24, openshift-install 4.19.24, jq, helm, podman, AWS CLI
+- Configured `~/.ibmcloud-h100-env` (all IDs populated dynamically by subsequent phases)
+- Pre-existing resources: CIS (`ocp-cis`), COS (`ocp-cos`), SSH key (`r010-3f6ad86f...`)
 
-### Cost
-- H100: ~$30-40/hour
-- Control plane: ~$0.50-1.00/hour
+### Phase 2: UPI Control Plane
+- Created VPC (`rdma-pvc-eude`) from scratch with subnet, public gateway, security group
+- Deployed OpenShift 4.19.24 via UPI (NOT IPI — IPI failed due to CAPI provider bugs)
+- 3 masters with `control-plane,master,worker` roles
+- DNS via CIS + Route 53 forwarder, CCM auto-creates load balancers
+
+### Phase 3: H100 Provisioning
+- Created cluster network (`rdma-cluster`, `hopper-1` profile) with 8 subnets
+- Provisioned H100 with RHCOS + worker ignition (`--user-data @worker.ign`)
+- Stopped instance, attached 8 cluster network interfaces, restarted
+- RDMA fabric initialization: 10-15 minutes on start
+- Cluster network interfaces survive instance deletion (reusable)
+
+### Phase 4: Worker Integration
+- Approved bootstrap + serving CSRs for H100 to join cluster
+- Applied labels: `node-role.kubernetes.io/gpu=true`, NVIDIA, RDMA, workload labels
+- Node: `ocp-gpu-worker-h100` (160 vCPU, 1.75 TiB RAM)
+
+### Phase 5: Operators (11 operators, 4 parts)
+- **Part A — GPU Stack**: NFD (auto-discovers GPUs + Mellanox NICs) + NVIDIA GPU Operator (ClusterPolicy, 8 GPUs)
+- **Part B — RDMA**: NVIDIA Network Operator + NicClusterPolicy (RDMA shared device plugin, 1k contexts)
+- **Part C — AI Platform**: cert-manager, RHCL, LWS, RHOAI 3.3.0 + Service Mesh 3.2.2
+- **Part D — Model Serving**: DataScienceCluster (KServe managed), GatewayClass, Istio gateway
+
+## Critical Technical Details (Learned During Deployment)
+
+### IPI vs UPI
+- IPI on IBM Cloud VPC failed (7 attempts) — CAPI provider creates instances with `metadata_service.enabled=false`, `user_data=null`
+- UPI works reliably with manual instance creation + worker ignition
+
+### NFD Configuration
+- `deviceClassWhitelist`: Must include `0200` (Ethernet) + `0300` + `0302` (GPU)
+- `deviceLabelFields`: Must be `[vendor]` only — GPU Operator needs `pci-10de.present`
+- Restart workers after config changes: `oc delete pods -n openshift-nfd -l app=nfd-worker`
+
+### GPU Operator (ClusterPolicy)
+- v25.10 CRD requires `daemonsets`, `dcgm`, `gfd` fields
+- `driver.rdma.enabled: false` unless NVIDIA Network Operator MOFED installed
+- `nvidia-smi` only inside driver container (`-c nvidia-driver-ctr`), NOT via `oc debug node`
+- Stable pod label: `app.kubernetes.io/component=nvidia-driver`
+
+### IBM Cloud RDMA — SR-IOV Does NOT Work
+- Cluster network NICs are VFs (`15b3:101e`), NOT PFs (`15b3:2344`)
+- SR-IOV operator rejects device ID `101e` (not in supported list)
+- Use NVIDIA Network Operator **RDMA shared device plugin** via `NicClusterPolicy` instead
+- `NicClusterPolicy` image repo: `nvcr.io/nvidia/mellanox` (not `cloud-native`), version field required
+
+### NVIDIA Network Operator
+- Install via **OLM** (`certified-operators`, package `nvidia-network-operator`), NOT Helm
+- Helm `upgrade-crd` job conflicts with OpenShift NFD CRDs (scope mismatch)
+
+### Service Mesh 3
+- Runs in `openshift-ingress` (NOT `istio-system`)
+- Chain upgrade can get stuck — delete intermediate CSV to unblock
+
+### OLM Package Names
+- RHCL: `rhcl-operator` (NOT `connectivity-link-operator`)
+- LWS: `leader-worker-set` (NOT `lws-operator`)
+- GPU: `gpu-operator-certified`, Network: `nvidia-network-operator`
+- NFD: `nfd`, RHOAI: `rhods-operator`, cert-manager: `openshift-cert-manager-operator`
 
 ## Architecture
 
-### Compute
-- **Control Plane**: 3 master nodes (bx2-8x32: 8 vCPU, 32GB RAM)
-- **Worker**: 1 H100 node (gx3d-160x1792x8h100: 160 vCPU, 1.75TB RAM, 8× H100 80GB GPUs)
+- **Control Plane**: 3x bx2-8x32 (8 vCPU, 32GB each)
+- **Worker**: 1x gx3d-160x1792x8h100 (160 vCPU, 1.75 TiB RAM, 8x H100 80GB)
+- **VPC Network**: Kubernetes API, kubelet, pod CNI (OVN-Kubernetes)
+- **Cluster Network**: 8x ConnectX-7 VFs (400 Gbps each, 3.2 Tbps total, RoCE v2)
+- **Region**: eu-de, Zone: eu-de-2
+- **Domain**: ocp-h100-cluster.ibmc.kni.syseng.devcluster.openshift.com
 
-### Network Design (Dual-Network)
-- **VPC Management Network**: Kubernetes API, kubelet, pod networking, services
-- **Cluster Network (RDMA)**: 8× ConnectX-7 NICs (400 Gbps each) = 3.2 Tbps total
-- **Protocol**: RoCE v2 with GPU Direct RDMA
-- **Isolation**: Complete separation between management and RDMA traffic
+## Operator Versions (validated 2026-03-10)
 
-### Software Stack
-- **OpenShift**: 4.20+ (IPI deployment)
-- **OS**: RHCOS (Red Hat Enterprise Linux CoreOS)
-- **Operators**: NFD → NMState → SR-IOV → NVIDIA Network → NVIDIA GPU (order critical)
-- **CNI**: OpenShift SDN/OVN-Kubernetes (primary) + SR-IOV CNI (secondary for RDMA)
+| Operator | Version | Package | Source |
+|---|---|---|---|
+| NFD | 4.19.0 | nfd | redhat-operators |
+| GPU Operator | 25.10.1 | gpu-operator-certified | certified-operators |
+| Network Operator | 26.1.0 | nvidia-network-operator | certified-operators |
+| cert-manager | 1.18.1 | openshift-cert-manager-operator | redhat-operators |
+| RHCL | 1.3.0 | rhcl-operator | redhat-operators |
+| LWS | 1.0.0 | leader-worker-set | redhat-operators |
+| RHOAI | 3.3.0 | rhods-operator | redhat-operators |
+| Service Mesh | 3.2.2 | servicemeshoperator3 | (auto via RHOAI) |
+| Authorino | 1.3.0 | | (auto via RHCL) |
+| Limitador | 1.3.0 | | (auto via RHCL) |
+| DNS | 1.3.0 | | (auto via RHCL) |
 
-## User Request
-"Document all the information. I will implement it based on your documentation and executable script. Think Hard"
+## File Locations
 
-## What I Delivered
+| File | Path |
+|---|---|
+| Manual guides | `~/Documents/knowledgebase/ibmc-ipi-roce/manual/` |
+| Phase guides | `PHASE1-PREREQUISITES.md` through `PHASE5-OPERATORS.md` |
+| Env config | `~/.ibmcloud-h100-env` |
+| Kubeconfig | `~/ocp-h100-upi-install/auth/kubeconfig` |
+| Admin password | `~/ocp-h100-upi-install/auth/kubeadmin-password` |
+| Pull secret | `~/.pull-secret.json` |
 
-### File Structure (32 files total)
-```
-deployment-scripts/
-├── README.md                         # Overview, architecture, quickstart
-├── EXECUTION-GUIDE.md                # Step-by-step execution instructions
-├── RUN-ALL-PHASES.sh                 # Master automation script
-├── DEPLOYMENT-SUMMARY.md             # Summary at root (created later)
-│
-├── docs/
-│   ├── ARCHITECTURE.md               # Dual-network, GPU Direct RDMA, scaling
-│   ├── TROUBLESHOOTING.md            # Issues by phase, debugging, support
-│   ├── POST-DEPLOYMENT.md            # AI/ML workloads, monitoring, optimization
-│   └── RISKS.md                      # Risk assessment, mitigation, support strategy
-│
-├── phase1-prerequisites/             # 2 scripts
-│   ├── 01-setup-prerequisites.sh     # Install tools (jq, helm, oc, openshift-install)
-│   └── 02-verify-environment.sh      # Verify IBM Cloud access, resources
-│
-├── phase2-ipi-control-plane/         # 3 scripts
-│   ├── 01-generate-install-config.sh # Create install-config.yaml
-│   ├── 02-deploy-cluster.sh          # Run openshift-install (45-60 min)
-│   └── 03-verify-control-plane.sh    # Verify 3 masters Ready, operators healthy
-│
-├── phase3-h100-provisioning/         # 3 scripts
-│   ├── 01-create-h100-instance.sh    # Create H100 with VPC network
-│   ├── 02-attach-cluster-networks.sh # Stop instance, attach 8 RDMA interfaces
-│   └── 03-start-h100-instance.sh     # Start instance, wait RDMA fabric (10-15 min)
-│
-├── phase4-worker-integration/        # 3 scripts + README
-│   ├── README.md                     # Integration approaches explanation
-│   ├── 01-prepare-h100-for-openshift.sh # Configure for cluster join
-│   ├── 02-approve-csrs.sh            # Approve certificate signing requests
-│   └── 03-label-h100-node.sh         # Apply GPU/RDMA labels, optional taints
-│
-├── phase5-rdma-operators/            # 6 scripts
-│   ├── 01-install-nfd.sh             # Node Feature Discovery
-│   ├── 02-install-nmstate.sh         # Network state management
-│   ├── 03-install-sriov.sh           # SR-IOV Network Operator
-│   ├── 04-install-nvidia-network-operator.sh # NVIDIA Network Operator (via Helm)
-│   ├── 05-configure-sriov-rdma.sh    # Create SriovNetworkNodePolicy, NetworkAttachmentDefinition
-│   └── 06-verify-rdma-resources.sh   # Verify rdma/rdma_mlx5 resources
-│
-├── phase6-gpu-operator/              # 3 scripts
-│   ├── 01-install-gpu-operator.sh    # NVIDIA GPU Operator
-│   ├── 02-create-cluster-policy.sh   # ClusterPolicy with GPUDirect RDMA enabled
-│   └── 03-verify-gpu-resources.sh    # Verify nvidia.com/gpu: 8
-│
-└── phase7-validation/                # 4 scripts
-    ├── 01-verify-cluster-health.sh   # Nodes, operators
-    ├── 02-test-rdma.sh               # Deploy test pod with RDMA annotation
-    ├── 03-test-gpu.sh                # Deploy test pod with GPU request
-    └── 04-test-nccl-optional.sh      # NCCL multi-GPU bandwidth test
-```
+## Deployment Guides (manual/ directory)
 
-### Script Features
-- **Error Handling**: `set -e` (exit on error), `set -u` (exit on undefined var)
-- **User Experience**: Color-coded output (red/yellow/green), progress indicators, confirmations
-- **Safety**: Dry-run where possible, backups of critical files, validation at each step
-- **Idempotency**: Most scripts can be re-run safely
-- **Documentation**: Inline comments, clear section headers, helpful error messages
+| Phase | File | Duration | Description |
+|---|---|---|---|
+| 1 | PHASE1-PREREQUISITES.md | 30 min | Tools, environment |
+| 2 | PHASE2-UPI-CONTROL-PLANE.md | 90-120 min | VPC + OpenShift UPI |
+| 3 | PHASE3-H100-PROVISIONING.md | 30-45 min | Cluster network + H100 |
+| 4 | PHASE4-WORKER-INTEGRATION.md | 10-15 min | CSR approval + labels |
+| 5 | PHASE5-OPERATORS.md | 45-60 min | GPU, RDMA, AI platform, model serving |
 
-### Documentation Coverage
-- **Architecture**: Network design, GPU Direct RDMA, operator stack, scaling
-- **Troubleshooting**: Issues by phase, debugging commands, when to escalate
-- **Post-Deployment**: AI/ML workloads (PyTorch/TensorFlow), monitoring, storage, optimization
-- **Risks**: Tech Preview implications, cost management, integration complexity
+## Infrastructure (Pre-existing, kept across deploys)
+- **SSH Key**: r010-3f6ad86f-6044-48fd-9bf4-b9cca40927b8
+- **CIS**: ocp-cis (domain: ibmc.kni.syseng.devcluster.openshift.com)
+- **COS**: ocp-cos (standard)
 
-## Deployment Phases (3-4.5 hours total)
+## Cost
+- Control plane: ~$0.50-1.00/hour
+- H100 worker: ~$30-40/hour
+- Stop H100 when not in use: `ibmcloud is instance-stop $H100_INSTANCE_ID --force`
+- H100 auto-rejoins cluster on restart (no CSR approval needed for short stops)
 
-1. **Prerequisites** (30 min): Install tools, configure environment
-2. **Control Plane** (45-60 min): Deploy 3 masters via openshift-install
-3. **H100 Provisioning** (20-30 min): Create instance, attach cluster networks
-4. **Worker Integration** (30-60 min): Join H100 via CSR approval (complex)
-5. **RDMA Operators** (30-40 min): NFD → NMState → SR-IOV → NVIDIA Network
-6. **GPU Operator** (20-30 min): Install GPU Operator, create ClusterPolicy
-7. **Validation** (15-20 min): Test cluster health, RDMA, GPU, optional NCCL
-
-## Critical Technical Details
-
-### Phase 4 Complexity (Worker Integration)
-- **Problem**: Cluster networks require instance STOPPED for attachment
-- **Impact**: Cannot use standard MachineSet automation
-- **Solution**: Manual CSR approval workflow
-- **Options**:
-  - A: RHCOS + ignition (requires reinstall + reattach cluster networks)
-  - B: RHEL + manual kubelet config (faster but less native)
-
-### RDMA Configuration
-- **Device**: ConnectX-7 (vendor: 15b3, deviceID: 2344)
-- **Resource Name**: rdma/rdma_mlx5
-- **SR-IOV**: numVfs: 0 (using physical functions, not VFs)
-- **NetworkAttachmentDefinition**: Name: rdma-cluster-network, IPAM: whereabouts
-- **Pod Annotation**: `k8s.v1.cni.cncf.io/networks: rdma-cluster-network`
-
-### GPU Configuration
-- **ClusterPolicy**:
-  - driver.rdma.enabled: true
-  - driver.rdma.useHostMofed: false (containerized MOFED)
-  - migManager.enabled: false (H100 uses full GPUs)
-- **NCCL Environment**:
-  - NCCL_IB_DISABLE=0
-  - NCCL_NET_GDR_LEVEL=5
-  - NCCL_IB_HCA=mlx5
-
-### Success Criteria
-- 3 master nodes Ready
-- 1 H100 worker Ready
-- All cluster operators Available=True, Degraded=False
-- Node resources: rdma/rdma_mlx5: 8, nvidia.com/gpu: 8
-- RDMA test: mlx5 devices accessible
-- GPU test: nvidia-smi works
-
-## Environment Configuration File
-Location: `~/.ibmcloud-h100-env`
-
-Critical variables:
-- IBMCLOUD_API_KEY (user must set)
-- VPC_ID, CN_ID, MGMT_SUBNET_ID, SG_ID, KEY_ID (pre-configured)
-- CN_SUBNET_ID_0 through CN_SUBNET_ID_7 (8 cluster network subnets)
-- H100_INSTANCE_ID (set by phase3 scripts)
-- H100_NODE_NAME (set by phase4 scripts)
-- KUBECONFIG (set after phase2)
-
-## Prerequisites User Must Download
-- **OpenShift Installer**: https://console.redhat.com/openshift/install (macOS 4.20+)
-- **Pull Secret**: https://console.redhat.com/openshift/install/pull-secret
-- **IBM Cloud API Key**: User must have one with VPC permissions
-
-## Known Limitations
-
-### Technology Preview
-- No Red Hat production SLA
-- Limited support
-- May have bugs or missing features
-- Not recommended for production
-
-### Scaling Challenges
-- Each H100 worker requires manual provisioning + cluster network attachment
-- No MachineSet automation due to cluster network requirement
-- Scripts must be run for each new node
-
-### Phase 4 Risk
-- Worker integration is non-standard
-- May require troubleshooting
-- CSR approval workflow is manual
-- If CSRs don't appear, requires debugging (network, kubelet, certificates)
-
-## User's Next Steps
-
-1. Download OpenShift installer and pull secret from Red Hat
-2. Execute: `./deployment-scripts/phase1-prerequisites/01-setup-prerequisites.sh`
-3. Edit `~/.ibmcloud-h100-env` to add IBM Cloud API key
-4. Follow `EXECUTION-GUIDE.md` phase by phase
-5. Validate at each checkpoint before proceeding
-
-## Important Files for User
-
-- **Start Here**: `deployment-scripts/README.md`
-- **Execution**: `deployment-scripts/EXECUTION-GUIDE.md`
-- **During Issues**: `deployment-scripts/docs/TROUBLESHOOTING.md`
-- **After Success**: `deployment-scripts/docs/POST-DEPLOYMENT.md`
-- **Credentials**: `~/ocp-h100-ipi-install/cluster-info.txt` (created during phase 2)
-- **Kubeconfig**: `~/ocp-h100-ipi-install/auth/kubeconfig`
-
-## What User Will Implement
-Everything. I created documentation and scripts. User executes them to perform actual deployment.
-
-## Project Status
-- ✅ Complete documentation package delivered (32 files)
-- ✅ All 7 phases scripted and documented
-- ✅ Validation tests included
-- ✅ Troubleshooting guide complete
-- ⏸️ Actual deployment: User's responsibility
-
-## Future Claude Sessions Should Know
-- This is a **documentation project**, not an implementation
-- User has existing IBM Cloud infrastructure (VPC, cluster network, subnets)
-- User wanted scripts to execute themselves, not for me to execute
-- All work is in `deployment-scripts/` directory
-- If user asks about "implementing" - refer them to the scripts
-- If errors occur during their execution - use `docs/TROUBLESHOOTING.md` as reference
+## For Future Claude Sessions
+- This is a **documentation + implementation project** — user executes manual guides step-by-step
+- All infrastructure is created from scratch by the guides (no hardcoded IDs except SSH key, CIS, COS)
+- The `deployment-scripts/` directory contains older automated scripts (pre-UPI) — manual guides in `manual/` are the current, validated path
+- User preference: review each command before executing, manual step-by-step
+- If deploying from scratch: start Phase 2 (Phase 1 tools already installed)
+- If H100 deleted but cluster exists: start Phase 3 (skip Steps 3-4 if cluster network exists)
+- If all operators deleted: start Phase 5

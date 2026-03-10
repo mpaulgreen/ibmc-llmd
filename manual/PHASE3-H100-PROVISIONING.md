@@ -495,16 +495,16 @@ ssh -o ConnectTimeout=60 -i ~/.ssh/id_rsa core@$H100_FIP "hostname && uptime"
 
 If connection times out, wait a few more minutes and retry — RHCOS with cluster networks takes 10-15 minutes to fully boot.
 
-#### 16b. Verify Instance Joined the Cluster
+#### 16b. Check for Pending CSRs
 
-From your local machine (not SSH):
+The H100 will NOT appear in `oc get nodes` yet — it needs CSR approval first (Phase 4). But you can check if kubelet has started generating CSRs:
 
 ```bash
 export KUBECONFIG=$HOME/ocp-h100-upi-install/auth/kubeconfig
-oc get nodes
+oc get csr | grep Pending
 ```
 
-The H100 worker should appear (may show `NotReady` until CSRs are approved in Phase 4).
+If no pending CSRs yet, wait a few more minutes — kubelet starts after RHCOS boot + RDMA fabric initialization. Proceed to Phase 4 to approve CSRs and complete the node join.
 
 #### 16c. Verify RDMA Devices (on instance via SSH)
 
