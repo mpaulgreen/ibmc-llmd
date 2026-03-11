@@ -107,7 +107,7 @@ oc get llminferenceservice qwen3-32b -n ${NAMESPACE} -o jsonpath='Replicas: {.sp
 ```bash
 echo "Waiting for vLLM pods..."
 while true; do
-  READY=$(oc get pods -n llm-d -l app=qwen3-32b --no-headers 2>/dev/null | grep Running | wc -l | tr -d ' ')
+  READY=$(oc get pods -n llm-d -l app.kubernetes.io/component=llminferenceservice-workload --no-headers 2>/dev/null | grep Running | wc -l | tr -d ' ')
   echo "  Running: $READY (expected: 4)"
   [ "$READY" -ge 4 ] && break
   sleep 15
@@ -118,7 +118,7 @@ echo "All vLLM pods ready."
 ### 3b. Check vLLM Logs for CPU Offloading
 
 ```bash
-VLLM_POD=$(oc get pods -n llm-d -l app=qwen3-32b -o jsonpath='{.items[0].metadata.name}')
+VLLM_POD=$(oc get pods -n llm-d -l app.kubernetes.io/component=llminferenceservice-workload -o jsonpath='{.items[0].metadata.name}')
 oc logs -n llm-d $VLLM_POD --tail=50 | grep -i -E "cpu|offload|cache"
 ```
 
@@ -217,7 +217,7 @@ The second request should show lower TTFT due to prefix cache reuse (either from
 ## Step 7: Check Cache Metrics
 
 ```bash
-VLLM_POD=$(oc get pods -n llm-d -l app=qwen3-32b -o jsonpath='{.items[0].metadata.name}')
+VLLM_POD=$(oc get pods -n llm-d -l app.kubernetes.io/component=llminferenceservice-workload -o jsonpath='{.items[0].metadata.name}')
 curl -s $(oc get pod $VLLM_POD -n llm-d -o jsonpath='{.status.podIP}'):8000/metrics | grep -i "cache"
 ```
 
@@ -289,7 +289,7 @@ oc delete namespace llm-d
 Check vLLM pod args:
 
 ```bash
-VLLM_POD=$(oc get pods -n llm-d -l app=qwen3-32b -o jsonpath='{.items[0].metadata.name}')
+VLLM_POD=$(oc get pods -n llm-d -l app.kubernetes.io/component=llminferenceservice-workload -o jsonpath='{.items[0].metadata.name}')
 oc get pod $VLLM_POD -n llm-d -o jsonpath='{.spec.containers[0].args}' | jq '.'
 ```
 

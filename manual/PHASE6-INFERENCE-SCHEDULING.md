@@ -452,8 +452,8 @@ oc get svc -n ${NAMESPACE} --no-headers
 If pods are slow to start, check logs:
 
 ```bash
-oc logs -n ${NAMESPACE} -l app=qwen3-32b --tail=20 2>/dev/null || \
-  oc logs -n ${NAMESPACE} $(oc get pods -n ${NAMESPACE} --no-headers | grep -v epp | grep -v gateway | head -1 | awk '{print $1}') --tail=20
+oc logs -n ${NAMESPACE} -l app.kubernetes.io/component=llminferenceservice-workload --tail=20 2>/dev/null || \
+  oc logs -n ${NAMESPACE} $(oc get pods -n ${NAMESPACE} --no-headers | grep -v router-scheduler | grep -v Completed | head -1 | awk '{print $1}') --tail=20
 ```
 
 Look for: `INFO: Application startup complete` or model loading progress.
@@ -567,12 +567,27 @@ for i in 1 2; do
 done
 ```
 
-Check EPP logs for routing decisions:
+### Investigating Routing Decisions
+
+The EPP (Endpoint Picker) scores each pod using `prefix-cache-scorer` (weight 2.0) + `load-aware-scorer` (weight 1.0), then picks the highest score. Per-request routing logs are not emitted at default log level, and EPP metrics (port 9090) are RBAC-locked (`--secure-serving`). Use vLLM per-pod metrics instead:
+
+**Check EPP scoring config:**
 
 ```bash
 EPP_POD=$(oc get pods -n ${NAMESPACE} --no-headers | grep router-scheduler | head -1 | awk '{print $1}')
-oc logs -n ${NAMESPACE} $EPP_POD --tail=20
+oc get pod $EPP_POD -n ${NAMESPACE} -o jsonpath='{.spec.containers[0].args}' | python3 -c "import sys,json; [print(a) for a in json.loads(sys.stdin.read()) if 'config' in a or 'scorer' in a.lower()]"
 ```
+
+**Check per-pod request distribution:**
+
+```bash
+for pod in $(oc get pods -n ${NAMESPACE} -l app.kubernetes.io/component=llminferenceservice-workload --no-headers | awk '{print $1}'); do
+  REQS=$(oc exec -n ${NAMESPACE} $pod -- curl -sk https://localhost:8000/metrics 2>/dev/null | grep "^vllm:request_success_total" | grep -v "0.0$")
+  echo "$pod: ${REQS:-  (no requests)}"
+done
+```
+
+If the EPP is routing correctly, the pod that received the first request should also receive the second identical request (prefix cache hit → higher score). Pods with no matching prefix will show fewer or zero requests.
 
 ---
 
