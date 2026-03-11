@@ -14,23 +14,26 @@ OpenShift on IBM Cloud VPC is a **Technology Preview** feature — no Red Hat pr
 
 ```
 OpenShift 4.19 UPI Cluster
-+-------------------------------------------------------+
-|  Control Plane (3 Masters)                             |
-|  +----------+  +----------+  +----------+             |
-|  | Master-0 |  | Master-1 |  | Master-2 |             |
-|  | bx2-8x32 |  | bx2-8x32 |  | bx2-8x32 |             |
-|  +----+-----+  +----+-----+  +----+-----+             |
-|       +------VPC Network (10.240.0.0/24)------+        |
-|                                                        |
-|  H100 Worker (gx3d-160x1792x8h100)                    |
-|  +--------------------------------------------------+ |
-|  | 160 vCPU | 1.75 TiB RAM | 8x H100 80GB HBM3     | |
-|  |                                                    | |
-|  | VPC Network: Kubernetes API, kubelet, pod CNI      | |
-|  | Cluster Network: 8x ConnectX-7 (400 Gbps each)    | |
-|  |                  3.2 Tbps total, RoCE v2           | |
-|  +--------------------------------------------------+ |
-+-------------------------------------------------------+
++---------------------------------------------------------------+
+|  Control Plane (3 Masters)                                     |
+|  +----------+  +----------+  +----------+                     |
+|  | Master-0 |  | Master-1 |  | Master-2 |                     |
+|  | bx2-8x32 |  | bx2-8x32 |  | bx2-8x32 |                     |
+|  +----+-----+  +----+-----+  +----+-----+                     |
+|       +------VPC Network (10.240.0.0/24)------+                |
+|                                                                |
+|  H100 Worker (gx3d-160x1792x8h100)                            |
+|  +----------------------------------------------------------+ |
+|  | 160 vCPU | 1.75 TiB RAM | 8x H100 80GB HBM3             | |
+|  | Cluster Network: 8x ConnectX-7 (400 Gbps each, RoCE v2)  | |
+|  +----------------------------------------------------------+ |
+|                                                                |
+|  H200 Worker (gx3d-160x1792x8h200)                             |
+|  +----------------------------------------------------------+ |
+|  | 160 vCPU | 1.75 TiB RAM | 8x H200 141GB HBM3e           | |
+|  | Cluster Network: 8x ConnectX-7 (400 Gbps each, RoCE v2)  | |
+|  +----------------------------------------------------------+ |
++---------------------------------------------------------------+
 ```
 
 ## Deployment Phases
@@ -40,7 +43,9 @@ OpenShift 4.19 UPI Cluster
 | **1** | [PHASE1-PREREQUISITES.md](PHASE1-PREREQUISITES.md) | 30 min | Install tools, configure environment |
 | **2** | [PHASE2-UPI-CONTROL-PLANE.md](PHASE2-UPI-CONTROL-PLANE.md) | 90-120 min | Create VPC, deploy OpenShift UPI (3 masters) |
 | **3** | [PHASE3-H100-PROVISIONING.md](PHASE3-H100-PROVISIONING.md) | 30-45 min | Create cluster network, provision H100 |
+| **3B** | [PHASE3B-H200-PROVISIONING.md](PHASE3B-H200-PROVISIONING.md) | 20-30 min | Provision H200 worker (reuse cluster network) |
 | **4** | [PHASE4-WORKER-INTEGRATION.md](PHASE4-WORKER-INTEGRATION.md) | 10-15 min | Join H100 to cluster via CSR approval |
+| **4B** | [PHASE4B-H200-WORKER-INTEGRATION.md](PHASE4B-H200-WORKER-INTEGRATION.md) | 10-15 min | Join H200 to cluster via CSR approval |
 | **5** | [PHASE5-OPERATORS.md](PHASE5-OPERATORS.md) | 45-60 min | GPU, RDMA, AI platform operators + model serving |
 | **6** | [PHASE6-INFERENCE-SCHEDULING.md](PHASE6-INFERENCE-SCHEDULING.md) | 30-45 min | LLMInferenceService — intelligent inference scheduling |
 | **7** | [PHASE7-TIERED-PREFIX-CACHE.md](PHASE7-TIERED-PREFIX-CACHE.md) | 15-20 min | CPU prefix cache offloading (add-on to Phase 6) |
@@ -88,20 +93,21 @@ Phase 5 installs 8+ operators in 4 parts:
 
 - **Control Plane** (3x bx2-8x32): ~$0.50-1.00/hour
 - **H100 Worker** (gx3d-160x1792x8h100): ~$30-40/hour
-- **Total**: ~$30-41/hour
+- **H200 Worker** (1x gx3d-160x1792x8h200): ~$30-40/hour
+- **Total (all running)**: ~$60-81/hour
 
-Stop the H100 when not in use (`ibmcloud is instance-stop $H100_INSTANCE_ID --force`). It auto-rejoins the cluster on restart.
+Stop GPU workers when not in use. They auto-rejoin the cluster on restart.
 
 ## Success Criteria
 
-After all 5 phases:
+After all phases (including 3B/4B):
 
-- [ ] 4 nodes Ready (3 masters + 1 H100 worker)
+- [ ] 5 nodes Ready (3 masters + 1 H100 + 1 H200 workers)
 - [ ] All cluster operators Available=True, Degraded=False
-- [ ] `nvidia.com/gpu: 8` allocatable on H100
-- [ ] `rdma/rdma_mlx5: 1k` allocatable on H100 (if Part B installed)
-- [ ] `nvidia-smi` shows 8x H100 80GB HBM3
-- [ ] 8 RDMA links ACTIVE/LINK_UP (if Part B installed)
+- [ ] `nvidia.com/gpu: 8` allocatable on each GPU worker
+- [ ] `rdma/rdma_mlx5: 1k` allocatable on each GPU worker (if Part B installed)
+- [ ] `nvidia-smi` shows 8x GPUs on each worker
+- [ ] 8 RDMA links ACTIVE/LINK_UP per worker (if Part B installed)
 - [ ] All operator CSVs Succeeded
 - [ ] DataScienceCluster Ready, GatewayClass Accepted
 
@@ -109,14 +115,16 @@ After all 5 phases:
 
 ```
 manual/
-+-- README.md                       # This file
-+-- PHASE1-PREREQUISITES.md         # Tools and environment setup
-+-- PHASE2-UPI-CONTROL-PLANE.md     # VPC creation + OpenShift UPI deployment
-+-- PHASE3-H100-PROVISIONING.md     # Cluster network + H100 instance
-+-- PHASE4-WORKER-INTEGRATION.md    # Worker node join via CSR approval
-+-- PHASE5-OPERATORS.md             # GPU, RDMA, AI platform operators
-+-- PHASE6-INFERENCE-SCHEDULING.md  # llm-d intelligent inference scheduling
-+-- PHASE7-TIERED-PREFIX-CACHE.md   # CPU prefix cache offloading
++-- README.md                            # This file
++-- PHASE1-PREREQUISITES.md              # Tools and environment setup
++-- PHASE2-UPI-CONTROL-PLANE.md          # VPC creation + OpenShift UPI deployment
++-- PHASE3-H100-PROVISIONING.md          # Cluster network + H100 instance
++-- PHASE3B-H200-PROVISIONING.md         # H200 instance (reuse cluster network)
++-- PHASE4-WORKER-INTEGRATION.md         # H100 worker join via CSR approval
++-- PHASE4B-H200-WORKER-INTEGRATION.md   # H200 worker join via CSR approval
++-- PHASE5-OPERATORS.md                  # GPU, RDMA, AI platform operators
++-- PHASE6-INFERENCE-SCHEDULING.md       # llm-d intelligent inference scheduling
++-- PHASE7-TIERED-PREFIX-CACHE.md        # CPU prefix cache offloading
 ```
 
 ## Getting Started
@@ -133,4 +141,4 @@ Start with **[Phase 1: Prerequisites](PHASE1-PREREQUISITES.md)** and proceed seq
 **OpenShift Version**: 4.19.24
 **Deployment Method**: UPI (User-Provisioned Infrastructure)
 **Region**: eu-de (Frankfurt), Zone: eu-de-2
-**GPU Profile**: gx3d-160x1792x8h100 (8x H100 80GB)
+**GPU Profiles**: gx3d-160x1792x8h100 (8x H100 80GB), gx3d-160x1792x8h200 (8x H200 141GB)

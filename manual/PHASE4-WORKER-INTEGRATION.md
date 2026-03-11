@@ -231,7 +231,7 @@ oc describe node ocp-gpu-worker-h100 | grep -A 5 "Conditions:"
 ### Step 8: Save Node Name to Environment
 
 ```bash
-export H100_NODE_NAME=$(oc get nodes --no-headers | grep -v master | awk '{print $1}')
+export H100_NODE_NAME=$(oc get nodes --no-headers | grep h100 | awk '{print $1}')
 echo "H100 Node Name: $H100_NODE_NAME"
 ```
 

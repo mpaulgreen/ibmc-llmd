@@ -1,13 +1,13 @@
-# Phase 5: Install Operators (GPU, AI Platform, Model Serving)
+# Phase 5: Install Operators (GPU, RDMA, AI Platform, Model Serving)
 
 ## Overview
 
-This phase installs the complete operator stack to enable GPU workloads and AI/ML model serving on the H100 worker node.
+This phase installs the complete operator stack to enable GPU workloads and AI/ML model serving on the H100 and H200 GPU worker nodes.
 
 **What You'll Accomplish:**
-- Install NFD Operator to discover GPU hardware features
-- Install NVIDIA GPU Operator to expose 8x H100 GPUs to Kubernetes
-- (Optional) Install RDMA operators for multi-node GPU training
+- Install NFD Operator to discover GPU hardware features on both nodes
+- Install NVIDIA Network Operator + NicClusterPolicy for RDMA between nodes
+- Install NVIDIA GPU Operator to expose 8x GPUs per node to Kubernetes
 - Install AI platform operators (cert-manager, RHCL, LWS, RHOAI)
 - Configure DataScienceCluster with KServe for model serving
 
@@ -16,32 +16,37 @@ This phase installs the complete operator stack to enable GPU workloads and AI/M
 ## Operator Install Order
 
 ```
-Part A: GPU Stack (Required)
+Part A: GPU Discovery (Required)
   Step 1: NFD Operator
-  Step 2: NVIDIA GPU Operator + ClusterPolicy
 
-Part B: RDMA Operators (Optional — Multi-Node Only)
-  Step 3: NVIDIA Network Operator + NicClusterPolicy (RDMA shared device plugin)
+Part B: RDMA + Network (Required)
+  Step 2: NVIDIA Network Operator
+  Step 3: NicClusterPolicy (RDMA shared device plugin)
 
-Part C: AI Platform Operators (Required for Model Serving)
-  Step 6: cert-manager
-  Step 7: Red Hat Connectivity Link (RHCL)
-  Step 8: Leader Worker Set (LWS) Operator
-  Step 9: Red Hat OpenShift AI (RHOAI) 3.0
+Part C: GPU Operator (Required)
+  Step 4: NVIDIA GPU Operator + ClusterPolicy
 
-Part D: Configure Model Serving (Required)
-  Step 10: Wait for DSCInitialization
-  Step 11: Create DataScienceCluster
-  Step 12: Final Verification
+Part D: AI Platform Operators (Required for Model Serving)
+  Step 5: cert-manager
+  Step 6: Red Hat Connectivity Link (RHCL)
+  Step 7: Leader Worker Set (LWS) Operator
+  Step 8: Red Hat OpenShift AI (RHOAI) 3.0
+
+Part E: Configure Model Serving (Required)
+  Step 9: Wait for DSCInitialization
+  Step 10: Create DataScienceCluster
+  Step 11: Final Verification
 ```
+
+> **Why this order?** The Network Operator + NicClusterPolicy must be installed before the GPU Operator so that the RDMA shared device plugin is ready when GPU Operator DaemonSets deploy to the worker nodes. This ensures both `nvidia.com/gpu` and `rdma/rdma_mlx5` resources are available on both GPU nodes.
 
 ## Operator Versions
 
 | Operator | Version | Channel | Source |
 |---|---|---|---|
 | NFD | 4.19.0 | stable | redhat-operators |
-| NVIDIA GPU Operator | 25.10.1 | v25.10 | certified-operators |
 | NVIDIA Network Operator | 26.1.0 | v26.1 | certified-operators |
+| NVIDIA GPU Operator | 25.10.1 | v25.10 | certified-operators |
 | cert-manager | 1.18.1 | stable-v1.18 | redhat-operators |
 | RHCL | 1.3.0 | stable | redhat-operators |
 | Authorino | 1.3.0 | (auto via RHCL) | -- |
@@ -53,10 +58,10 @@ Part D: Configure Model Serving (Required)
 
 ## Pre-Flight Checks
 
-Before starting, ensure Phases 1-4 are complete:
+Before starting, ensure Phases 1-4 and 3B/4B are complete:
 
-- [ ] OpenShift cluster deployed — 3 masters + 1 H100 worker, all Ready
-- [ ] H100 node labeled (Phase 4 Step 9)
+- [ ] OpenShift cluster deployed — 3 masters + 1 H100 + 1 H200 worker, all Ready
+- [ ] Both GPU nodes labeled (Phase 4 Step 9, Phase 4B Step 9)
 - [ ] Environment file loaded: `source ~/.ibmcloud-h100-env`
 - [ ] KUBECONFIG set and working
 
@@ -71,14 +76,15 @@ export KUBECONFIG=$HOME/ocp-h100-upi-install/auth/kubeconfig
 oc get nodes
 ```
 
-Should show 4 nodes, all Ready:
+Should show 5 nodes, all Ready:
 
 ```
-NAME                   STATUS   ROLES                         AGE   VERSION
-ocp-master-0           Ready    control-plane,master,worker   Xh    v1.32.x
-ocp-master-1           Ready    control-plane,master,worker   Xh    v1.32.x
-ocp-master-2           Ready    control-plane,master,worker   Xh    v1.32.x
-ocp-gpu-worker-h100    Ready    worker                        Xm    v1.32.x
+NAME                    STATUS   ROLES                         AGE   VERSION
+ocp-master-0            Ready    control-plane,master,worker   Xh    v1.32.x
+ocp-master-1            Ready    control-plane,master,worker   Xh    v1.32.x
+ocp-master-2            Ready    control-plane,master,worker   Xh    v1.32.x
+ocp-gpu-worker-h100     Ready    gpu,worker                    Xm    v1.32.x
+ocp-gpu-worker-h200-0   Ready    gpu,worker                    Xm    v1.32.x
 ```
 
 ```bash
@@ -89,7 +95,7 @@ oc whoami
 
 ---
 
-# Part A: GPU Stack (Required)
+# Part A: GPU Discovery (Required)
 
 ---
 
@@ -197,18 +203,22 @@ sleep 30
 oc get pods -n openshift-nfd
 ```
 
-**Expected**: `nfd-controller-manager`, `nfd-master`, and `nfd-worker` pods all Running.
+**Expected**: `nfd-controller-manager`, `nfd-master`, and `nfd-worker` pods all Running. NFD worker pods should run on both GPU nodes.
 
-### 1g. Verify PCI Vendor Labels
+### 1g. Verify PCI Vendor Labels on Both GPU Nodes
 
-NFD auto-discovers GPUs and Mellanox NICs and labels the node. Wait 1-2 minutes:
+NFD auto-discovers GPUs and Mellanox NICs and labels the nodes. Wait 1-2 minutes:
 
 ```bash
 sleep 60
-oc get node ocp-gpu-worker-h100 -o json | jq '.metadata.labels | with_entries(select(.key | startswith("feature.node.kubernetes.io/pci-1")))'
+for NODE in ocp-gpu-worker-h100 ocp-gpu-worker-h200-0; do
+  echo "=== $NODE ==="
+  oc get node $NODE -o json | jq '.metadata.labels | with_entries(select(.key | startswith("feature.node.kubernetes.io/pci-1")))'
+  echo ""
+done
 ```
 
-**Expected**:
+**Expected** on each node:
 
 ```json
 {
@@ -226,9 +236,189 @@ Both labels are NFD-managed and survive node restarts.
 
 ---
 
-## Step 2: Install NVIDIA GPU Operator
+# Part B: RDMA + Network (Required)
+
+RDMA operators are required for multi-node GPU communication. The RDMA shared device plugin discovers the 8 Mellanox VFs per node and registers them as `rdma/rdma_mlx5` Kubernetes extended resources.
+
+> **Why not SR-IOV?** IBM Cloud presents the cluster network ConnectX-7 NICs as Virtual Functions (`15b3:101e`) to the guest VM. The OpenShift SR-IOV operator rejects device ID `101e` (not in its supported device list). The RDMA shared device plugin works with any RDMA-capable device without a vendor allowlist.
+
+---
+
+## Step 2: Install NVIDIA Network Operator
 
 ### 2a. Create Namespace
+
+```bash
+oc apply -f - <<EOF
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nvidia-network-operator
+EOF
+```
+
+### 2b. Create OperatorGroup
+
+```bash
+oc apply -f - <<EOF
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: nvidia-network-operator
+  namespace: nvidia-network-operator
+spec:
+  targetNamespaces:
+    - nvidia-network-operator
+EOF
+```
+
+### 2c. Create Subscription
+
+```bash
+oc apply -f - <<EOF
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: nvidia-network-operator
+  namespace: nvidia-network-operator
+spec:
+  channel: v26.1
+  installPlanApproval: Automatic
+  name: nvidia-network-operator
+  source: certified-operators
+  sourceNamespace: openshift-marketplace
+  startingCSV: nvidia-network-operator.v26.1.0
+EOF
+```
+
+### 2d. Wait for NVIDIA Network Operator Ready
+
+```bash
+echo "Waiting for NVIDIA Network Operator..."
+while ! oc get csv -n nvidia-network-operator 2>/dev/null | grep nvidia-network-operator | grep -q Succeeded; do
+  sleep 10
+  echo -n "."
+done
+echo ""
+echo "NVIDIA Network Operator installed."
+```
+
+Verify:
+
+```bash
+oc get csv -n nvidia-network-operator
+```
+
+**Expected**: `nvidia-network-operator.v26.1.0` with phase `Succeeded`.
+
+---
+
+## Step 3: Create NicClusterPolicy
+
+The NicClusterPolicy tells the Network Operator to deploy the RDMA shared device plugin, which discovers the 8 Mellanox VFs per node and registers them as `rdma/rdma_mlx5` resources:
+
+```bash
+oc apply -f - <<EOF
+apiVersion: mellanox.com/v1alpha1
+kind: NicClusterPolicy
+metadata:
+  name: nic-cluster-policy
+spec:
+  rdmaSharedDevicePlugin:
+    image: k8s-rdma-shared-dev-plugin
+    repository: nvcr.io/nvidia/mellanox
+    version: network-operator-v26.1.0
+    config: |
+      {
+        "configList": [{
+          "resourceName": "rdma_mlx5",
+          "rdmaHcaMax": 1000,
+          "selectors": {
+            "vendors": ["15b3"],
+            "deviceIDs": ["101e"],
+            "drivers": ["mlx5_core"]
+          }
+        }]
+      }
+EOF
+```
+
+> **IBM Cloud specifics**:
+> - `deviceIDs: ["101e"]` — ConnectX Family mlx5Gen Virtual Function (how IBM Cloud presents ConnectX-7 NICs to the guest)
+> - `rdmaHcaMax: 1000` — maximum concurrent RDMA contexts per device (shared mode allows multiple pods to use the same RDMA device)
+> - Image repository is `nvcr.io/nvidia/mellanox` (not `nvcr.io/nvidia/cloud-native`)
+
+### 3a. Wait for NicClusterPolicy Ready
+
+```bash
+echo "Waiting for NicClusterPolicy..."
+while true; do
+  STATE=$(oc get nicclusterpolicy nic-cluster-policy -o jsonpath='{.status.state}' 2>/dev/null)
+  if [ "$STATE" = "ready" ]; then
+    echo ""
+    echo "NicClusterPolicy is ready."
+    break
+  fi
+  echo -n "."
+  sleep 10
+done
+```
+
+Verify the RDMA shared device plugin pods are running on both GPU nodes:
+
+```bash
+oc get pods -n nvidia-network-operator -o wide --no-headers | grep rdma
+```
+
+**Expected**: `rdma-shared-dp-ds-*` pods Running on both `ocp-gpu-worker-h100` and `ocp-gpu-worker-h200-0`.
+
+### 3b. Verify RDMA Resources on Both Nodes
+
+```bash
+for NODE in ocp-gpu-worker-h100 ocp-gpu-worker-h200-0; do
+  echo "=== $NODE ==="
+  oc get node $NODE -o jsonpath='Capacity:    {.status.capacity.rdma/rdma_mlx5}{"\n"}Allocatable: {.status.allocatable.rdma/rdma_mlx5}{"\n"}'
+  echo ""
+done
+```
+
+**Expected** per node:
+
+```
+Capacity:    1k
+Allocatable: 1k
+```
+
+RDMA resources registered (1000 contexts per `rdmaHcaMax` setting).
+
+### 3c. Verify RDMA Links Active on Both Nodes
+
+```bash
+for NODE in ocp-gpu-worker-h100 ocp-gpu-worker-h200-0; do
+  echo "=== $NODE ==="
+  oc debug node/$NODE -- chroot /host rdma link show
+  echo ""
+done
+```
+
+**Expected** per node: 8 RDMA links, all `state ACTIVE physical_state LINK_UP`:
+
+```
+link mlx5_0/1 state ACTIVE physical_state LINK_UP netdev enp233s0
+link mlx5_1/1 state ACTIVE physical_state LINK_UP netdev enp223s0
+...
+link mlx5_7/1 state ACTIVE physical_state LINK_UP netdev enp163s0
+```
+
+---
+
+# Part C: GPU Operator (Required)
+
+---
+
+## Step 4: Install NVIDIA GPU Operator
+
+### 4a. Create Namespace
 
 ```bash
 oc apply -f - <<EOF
@@ -239,7 +429,7 @@ metadata:
 EOF
 ```
 
-### 2b. Create OperatorGroup
+### 4b. Create OperatorGroup
 
 ```bash
 oc apply -f - <<EOF
@@ -254,7 +444,7 @@ spec:
 EOF
 ```
 
-### 2c. Create Subscription
+### 4c. Create Subscription
 
 ```bash
 oc apply -f - <<EOF
@@ -273,7 +463,7 @@ spec:
 EOF
 ```
 
-### 2d. Wait for GPU Operator Ready
+### 4d. Wait for GPU Operator Ready
 
 ```bash
 echo "Waiting for GPU Operator..."
@@ -293,7 +483,7 @@ oc get csv -n nvidia-gpu-operator
 
 **Expected**: `gpu-operator-certified.v25.10.1` with phase `Succeeded`.
 
-### 2e. Create ClusterPolicy
+### 4e. Create ClusterPolicy
 
 The ClusterPolicy tells the GPU Operator how to configure GPU resources:
 
@@ -350,20 +540,15 @@ spec:
 EOF
 ```
 
-> **Note on `driver.rdma.enabled: false`**: RDMA in the ClusterPolicy requires MOFED (Mellanox OFED). With `enabled: true`, the driver init container waits for the NVIDIA Network Operator to install containerized MOFED — which blocks driver loading if the Network Operator isn't installed. Set to `false` for single-node. If you install RDMA operators (Part B), patch it back:
-> ```bash
-> oc patch clusterpolicy gpu-cluster-policy --type merge -p '{"spec":{"driver":{"rdma":{"enabled":true}}}}'
-> ```
+> **Note on `driver.rdma.enabled: false`**: RDMA connectivity between nodes works via the NicClusterPolicy RDMA shared device plugin (Part B) + host kernel RDMA modules (`mlx5_ib`, `ib_core`). Setting `driver.rdma.enabled: true` would enable GPUDirect RDMA (`nvidia-peermem` module) but requires MOFED, which is not installed on RHCOS. The current setup provides regular RDMA — sufficient for P/D disaggregation with NIXL. GPUDirect RDMA can be added later if needed for Wide Expert Parallelism.
 
-> **Note on `migManager.enabled: true`**: The GPU Operator detects whether MIG is configured on the GPUs. With `enabled: true`, the MIG manager pod runs but takes no action if MIG is not configured — this is the recommended default.
+### 4f. Wait for ClusterPolicy Ready
 
-### 2f. Wait for ClusterPolicy Ready
-
-This takes 5-10 minutes as the operator deploys driver containers, device plugin, DCGM exporter, etc.
+This takes 5-10 minutes as the operator deploys driver containers, device plugin, DCGM exporter, etc. on both GPU nodes.
 
 ```bash
 echo "Waiting for ClusterPolicy to become ready..."
-echo "This takes 5-10 minutes (driver compilation, container pulls)."
+echo "This takes 5-10 minutes (driver compilation, container pulls on both nodes)."
 while true; do
   STATE=$(oc get clusterpolicy gpu-cluster-policy -o jsonpath='{.status.state}' 2>/dev/null)
   if [ "$STATE" = "ready" ]; then
@@ -376,230 +561,66 @@ while true; do
 done
 ```
 
-### 2g. Verify GPU Operator Pods
+### 4g. Verify GPU Operator Pods
 
 ```bash
 oc get pods -n nvidia-gpu-operator -o wide
 ```
 
-**Expected**: All pods Running. Key pods to look for:
-- `nvidia-driver-daemonset-*` — NVIDIA kernel driver
-- `nvidia-device-plugin-daemonset-*` — Exposes GPUs to kubelet
+**Expected**: All pods Running on both GPU nodes. Key pods to look for:
+- `nvidia-driver-daemonset-*` — NVIDIA kernel driver (one per GPU node)
+- `nvidia-device-plugin-daemonset-*` — Exposes GPUs to kubelet (one per GPU node)
 - `nvidia-dcgm-exporter-*` — GPU metrics
 - `nvidia-operator-validator-*` — Validates GPU setup
 - `gpu-operator-*` — Operator controller
 
-### 2h. Verify GPU Resources on Node
+### 4h. Verify GPU Resources on Both Nodes
 
 ```bash
-oc get node ocp-gpu-worker-h100 -o jsonpath='Capacity:    {.status.capacity.nvidia\.com/gpu}{"\n"}Allocatable: {.status.allocatable.nvidia\.com/gpu}{"\n"}'
+for NODE in ocp-gpu-worker-h100 ocp-gpu-worker-h200-0; do
+  echo "=== $NODE ==="
+  oc get node $NODE -o jsonpath='Capacity:    {.status.capacity.nvidia\.com/gpu}{"\n"}Allocatable: {.status.allocatable.nvidia\.com/gpu}{"\n"}'
+  echo ""
+done
 ```
 
-**Expected**:
+**Expected** per node:
 
 ```
 Capacity:    8
 Allocatable: 8
 ```
 
-8 H100 GPUs are now schedulable.
+8 GPUs schedulable per node (16 total across both nodes).
 
-### 2i. Verify nvidia-smi
+### 4i. Verify nvidia-smi on Both Nodes
 
-Run `nvidia-smi` via the driver container (the GPU Operator uses containerized drivers, so `nvidia-smi` is only available inside the driver pod):
-
-```bash
-DRIVER_POD=$(oc get pods -n nvidia-gpu-operator -l app.kubernetes.io/component=nvidia-driver -o jsonpath='{.items[0].metadata.name}')
-oc exec -n nvidia-gpu-operator $DRIVER_POD -c nvidia-driver-ctr -- nvidia-smi
-```
-
-**Expected**: Shows 8x NVIDIA H100 80GB HBM3 GPUs with driver version and CUDA version.
-
----
-
-# Part B: RDMA Operators (Optional -- Multi-Node Only)
-
-> **Skip this entire section if you have a single GPU node.**
->
-> RDMA operators are only needed for multi-node GPU training where NCCL communicates across nodes over the cluster network (ConnectX-7 NICs, RoCE v2). For single-node inference or single-node multi-GPU training, the 8 H100 GPUs communicate via NVLink/NVSwitch within the node -- no RDMA operators required.
-
----
-
-## Step 3: Install NVIDIA Network Operator (Multi-Node Only)
-
-The NVIDIA Network Operator deploys the RDMA shared device plugin, which discovers RDMA-capable devices and registers them as Kubernetes extended resources.
-
-> **Why not SR-IOV?** IBM Cloud presents the cluster network ConnectX-7 NICs as Virtual Functions (`15b3:101e`) to the guest VM. The OpenShift SR-IOV operator rejects device ID `101e` (not in its supported device list). The RDMA shared device plugin works with any RDMA-capable device without a vendor allowlist.
-
-### 3a. Create Namespace
+Run `nvidia-smi` via the driver container on each node:
 
 ```bash
-oc apply -f - <<EOF
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: nvidia-network-operator
-EOF
-```
-
-### 3b. Create OperatorGroup
-
-```bash
-oc apply -f - <<EOF
-apiVersion: operators.coreos.com/v1
-kind: OperatorGroup
-metadata:
-  name: nvidia-network-operator
-  namespace: nvidia-network-operator
-spec:
-  targetNamespaces:
-    - nvidia-network-operator
-EOF
-```
-
-### 3c. Create Subscription
-
-```bash
-oc apply -f - <<EOF
-apiVersion: operators.coreos.com/v1alpha1
-kind: Subscription
-metadata:
-  name: nvidia-network-operator
-  namespace: nvidia-network-operator
-spec:
-  channel: v26.1
-  installPlanApproval: Automatic
-  name: nvidia-network-operator
-  source: certified-operators
-  sourceNamespace: openshift-marketplace
-  startingCSV: nvidia-network-operator.v26.1.0
-EOF
-```
-
-### 3d. Wait for NVIDIA Network Operator Ready
-
-```bash
-echo "Waiting for NVIDIA Network Operator..."
-while ! oc get csv -n nvidia-network-operator 2>/dev/null | grep nvidia-network-operator | grep -q Succeeded; do
-  sleep 10
-  echo -n "."
+for NODE in ocp-gpu-worker-h100 ocp-gpu-worker-h200-0; do
+  echo "=== $NODE ==="
+  DRIVER_POD=$(oc get pods -n nvidia-gpu-operator -l app.kubernetes.io/component=nvidia-driver --field-selector spec.nodeName=$NODE -o jsonpath='{.items[0].metadata.name}')
+  oc exec -n nvidia-gpu-operator $DRIVER_POD -c nvidia-driver-ctr -- nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+  echo ""
 done
-echo ""
-echo "NVIDIA Network Operator installed."
-```
-
-Verify:
-
-```bash
-oc get csv -n nvidia-network-operator
-```
-
-**Expected**: `nvidia-network-operator.v26.1.0` with phase `Succeeded`.
-
-### 3e. Create NicClusterPolicy
-
-The NicClusterPolicy tells the Network Operator to deploy the RDMA shared device plugin, which discovers the 8 Mellanox VFs and registers them as `rdma/rdma_mlx5` resources:
-
-```bash
-oc apply -f - <<EOF
-apiVersion: mellanox.com/v1alpha1
-kind: NicClusterPolicy
-metadata:
-  name: nic-cluster-policy
-spec:
-  rdmaSharedDevicePlugin:
-    image: k8s-rdma-shared-dev-plugin
-    repository: nvcr.io/nvidia/mellanox
-    version: network-operator-v26.1.0
-    config: |
-      {
-        "configList": [{
-          "resourceName": "rdma_mlx5",
-          "rdmaHcaMax": 1000,
-          "selectors": {
-            "vendors": ["15b3"],
-            "deviceIDs": ["101e"],
-            "drivers": ["mlx5_core"]
-          }
-        }]
-      }
-EOF
-```
-
-> **IBM Cloud specifics**:
-> - `deviceIDs: ["101e"]` — ConnectX Family mlx5Gen Virtual Function (how IBM Cloud presents ConnectX-7 NICs to the guest)
-> - `rdmaHcaMax: 1000` — maximum concurrent RDMA contexts per device (shared mode allows multiple pods to use the same RDMA device)
-> - Image repository is `nvcr.io/nvidia/mellanox` (not `nvcr.io/nvidia/cloud-native`)
-
-### 3f. Wait for NicClusterPolicy Ready
-
-```bash
-echo "Waiting for NicClusterPolicy..."
-while true; do
-  STATE=$(oc get nicclusterpolicy nic-cluster-policy -o jsonpath='{.status.state}' 2>/dev/null)
-  if [ "$STATE" = "ready" ]; then
-    echo ""
-    echo "NicClusterPolicy is ready."
-    break
-  fi
-  echo -n "."
-  sleep 10
-done
-```
-
-Verify the RDMA shared device plugin pod is running on the H100:
-
-```bash
-oc get pods -n nvidia-network-operator -o wide --no-headers | grep rdma
-```
-
-**Expected**: `rdma-shared-dp-ds-*` pod Running on `ocp-gpu-worker-h100`.
-
-### 3g. Verify RDMA Resources
-
-```bash
-oc get node ocp-gpu-worker-h100 -o jsonpath='Capacity:    {.status.capacity.rdma/rdma_mlx5}{"\n"}Allocatable: {.status.allocatable.rdma/rdma_mlx5}{"\n"}'
 ```
 
 **Expected**:
-
-```
-Capacity:    1k
-Allocatable: 1k
-```
-
-RDMA resources registered (1000 contexts per `rdmaHcaMax` setting).
-
-### 3h. Verify RDMA Links Active
-
-```bash
-oc debug node/ocp-gpu-worker-h100 -- chroot /host rdma link show
-```
-
-**Expected**: 8 RDMA links, all `state ACTIVE physical_state LINK_UP`:
-
-```
-link mlx5_0/1 state ACTIVE physical_state LINK_UP netdev enp233s0
-link mlx5_1/1 state ACTIVE physical_state LINK_UP netdev enp223s0
-link mlx5_2/1 state ACTIVE physical_state LINK_UP netdev enp213s0
-link mlx5_3/1 state ACTIVE physical_state LINK_UP netdev enp203s0
-link mlx5_4/1 state ACTIVE physical_state LINK_UP netdev enp193s0
-link mlx5_5/1 state ACTIVE physical_state LINK_UP netdev enp183s0
-link mlx5_6/1 state ACTIVE physical_state LINK_UP netdev enp173s0
-link mlx5_7/1 state ACTIVE physical_state LINK_UP netdev enp163s0
-```
+- H100 node: 8x `NVIDIA H100 80GB HBM3, 81559 MiB`
+- H200 node: 8x `NVIDIA H200, 143872 MiB` (or similar)
 
 ---
 
-# Part C: AI Platform Operators (Required for Model Serving)
+# Part D: AI Platform Operators (Required for Model Serving)
 
 ---
 
-## Step 6: Install cert-manager Operator
+## Step 5: Install cert-manager Operator
 
 cert-manager manages TLS certificates for RHOAI and KServe.
 
-### 6a. Create Namespace
+### 5a. Create Namespace
 
 ```bash
 oc apply -f - <<EOF
@@ -610,7 +631,7 @@ metadata:
 EOF
 ```
 
-### 6b. Create OperatorGroup
+### 5b. Create OperatorGroup
 
 ```bash
 oc apply -f - <<EOF
@@ -625,7 +646,7 @@ spec:
 EOF
 ```
 
-### 6c. Create Subscription
+### 5c. Create Subscription
 
 ```bash
 oc apply -f - <<EOF
@@ -643,7 +664,7 @@ spec:
 EOF
 ```
 
-### 6d. Wait for cert-manager Ready
+### 5d. Wait for cert-manager Ready
 
 ```bash
 echo "Waiting for cert-manager operator..."
@@ -663,7 +684,7 @@ oc get csv -n cert-manager-operator
 
 **Expected**: `cert-manager-operator.v1.18.1` with phase `Succeeded`.
 
-### 6e. Verify cert-manager Pods
+### 5e. Verify cert-manager Pods
 
 ```bash
 oc get pods -n cert-manager
@@ -673,11 +694,11 @@ oc get pods -n cert-manager
 
 ---
 
-## Step 7: Install Red Hat Connectivity Link (RHCL)
+## Step 6: Install Red Hat Connectivity Link (RHCL)
 
 RHCL provides API gateway capabilities (AuthPolicy, RateLimitPolicy) used by RHOAI for model serving endpoints.
 
-### 7a. Create Subscription
+### 6a. Create Subscription
 
 RHCL installs in `openshift-operators` namespace (global scope, no OperatorGroup needed):
 
@@ -697,7 +718,7 @@ spec:
 EOF
 ```
 
-### 7b. Wait for RHCL Operator Ready
+### 6b. Wait for RHCL Operator Ready
 
 ```bash
 echo "Waiting for RHCL operator..."
@@ -709,7 +730,7 @@ echo ""
 echo "RHCL operator installed."
 ```
 
-### 7c. Approve Sub-Operator Install Plans
+### 6c. Approve Sub-Operator Install Plans
 
 RHCL auto-creates subscriptions for Authorino, Limitador, and DNS operators. These may need install plan approval:
 
@@ -732,7 +753,7 @@ for plan in $(oc get installplan -n openshift-operators --no-headers | awk '{pri
 done
 ```
 
-### 7d. Wait for All RHCL Sub-Operators
+### 6d. Wait for All RHCL Sub-Operators
 
 ```bash
 echo "Waiting for Authorino, Limitador, DNS operators..."
@@ -746,7 +767,7 @@ for op in authorino-operator limitador-operator dns-operator; do
 done
 ```
 
-### 7e. Verify RHCL CRDs
+### 6e. Verify RHCL CRDs
 
 ```bash
 oc get crd | grep -E 'authpolic|ratelimitpolic'
@@ -756,11 +777,11 @@ oc get crd | grep -E 'authpolic|ratelimitpolic'
 
 ---
 
-## Step 8: Install Leader Worker Set (LWS) Operator
+## Step 7: Install Leader Worker Set (LWS) Operator
 
 LWS enables leader-worker topology for distributed inference workloads.
 
-### 8a. Create Namespace
+### 7a. Create Namespace
 
 ```bash
 oc apply -f - <<EOF
@@ -771,7 +792,7 @@ metadata:
 EOF
 ```
 
-### 8b. Create OperatorGroup
+### 7b. Create OperatorGroup
 
 ```bash
 oc apply -f - <<EOF
@@ -786,7 +807,7 @@ spec:
 EOF
 ```
 
-### 8c. Create Subscription
+### 7c. Create Subscription
 
 ```bash
 oc apply -f - <<EOF
@@ -804,7 +825,7 @@ spec:
 EOF
 ```
 
-### 8d. Wait for LWS Operator Ready
+### 7d. Wait for LWS Operator Ready
 
 ```bash
 echo "Waiting for LWS operator..."
@@ -824,7 +845,7 @@ oc get csv -n openshift-lws-operator
 
 **Expected**: `leader-worker-set.v1.0.0` with phase `Succeeded`.
 
-### 8e. Create LeaderWorkerSetOperator CR
+### 7e. Create LeaderWorkerSetOperator CR
 
 The LWS operator follows the meta-operator pattern — the CSV deploys the operator pod, but the actual LWS controller and `LeaderWorkerSet` CRD are only created when you create the operand CR:
 
@@ -839,7 +860,7 @@ spec:
 EOF
 ```
 
-### 8f. Wait for LWS CRD
+### 7f. Wait for LWS CRD
 
 ```bash
 echo "Waiting for LeaderWorkerSet CRD..."
@@ -864,11 +885,11 @@ oc get leaderworkersetoperators.operator.openshift.io cluster \
 
 ---
 
-## Step 9: Install Red Hat OpenShift AI (RHOAI) 3.0
+## Step 8: Install Red Hat OpenShift AI (RHOAI) 3.0
 
 RHOAI provides the model serving platform (KServe, data science pipelines, model registry).
 
-### 9a. Create Namespace
+### 8a. Create Namespace
 
 ```bash
 oc apply -f - <<EOF
@@ -881,7 +902,7 @@ metadata:
 EOF
 ```
 
-### 9b. Create OperatorGroup
+### 8b. Create OperatorGroup
 
 ```bash
 oc apply -f - <<EOF
@@ -896,7 +917,7 @@ EOF
 
 > Note: Empty `spec` (no `targetNamespaces`) gives RHOAI cluster-wide scope, which it requires.
 
-### 9c. Create Subscription
+### 8c. Create Subscription
 
 ```bash
 oc apply -f - <<EOF
@@ -914,7 +935,7 @@ spec:
 EOF
 ```
 
-### 9d. Wait for RHOAI Operator Ready
+### 8d. Wait for RHOAI Operator Ready
 
 RHOAI takes longer to install (pulls multiple images):
 
@@ -928,7 +949,7 @@ echo ""
 echo "RHOAI operator installed."
 ```
 
-### 9e. Approve Service Mesh 3 Install Plan
+### 8e. Approve Service Mesh 3 Install Plan
 
 RHOAI auto-installs Service Mesh 3. Check for pending install plans:
 
@@ -958,9 +979,9 @@ for plan in $(oc get installplan -n redhat-ods-operator --no-headers | awk '{pri
 done
 ```
 
-### 9f. Fix Service Mesh Chain Upgrade (if stuck)
+### 8f. Fix Service Mesh Chain Upgrade (if stuck)
 
-Service Mesh may install via a chain upgrade (e.g., v3.0.8 → v3.1.0 → v3.2.2). The intermediate CSV (v3.1.0) can fail with a CRD migration error (`risk of data loss updating ztunnels.sailoperator.io`), blocking the final version.
+Service Mesh may install via a chain upgrade (e.g., v3.0.8 -> v3.1.0 -> v3.2.2). The intermediate CSV (v3.1.0) can fail with a CRD migration error (`risk of data loss updating ztunnels.sailoperator.io`), blocking the final version.
 
 Check for stuck intermediate CSVs:
 
@@ -979,7 +1000,7 @@ if [ -n "$STUCK_CSV" ]; then
 fi
 ```
 
-### 9g. Wait for Service Mesh Operator
+### 8g. Wait for Service Mesh Operator
 
 ```bash
 echo "Waiting for Service Mesh operator..."
@@ -991,7 +1012,7 @@ echo ""
 echo "Service Mesh operator installed."
 ```
 
-### 9h. Verify Both Operators
+### 8h. Verify Both Operators
 
 ```bash
 oc get csv -n redhat-ods-operator
@@ -1004,11 +1025,11 @@ oc get csv -n openshift-operators | grep servicemesh
 
 ---
 
-# Part D: Configure Model Serving (Required)
+# Part E: Configure Model Serving (Required)
 
 ---
 
-## Step 10: Wait for DSCInitialization
+## Step 9: Wait for DSCInitialization
 
 RHOAI automatically creates a `DSCInitialization` resource. Wait for it to reconcile:
 
@@ -1042,7 +1063,7 @@ oc get dscinitializations
 
 ---
 
-## Step 11: Create DataScienceCluster
+## Step 10: Create DataScienceCluster
 
 Create a minimal DataScienceCluster with only KServe enabled:
 
@@ -1085,7 +1106,7 @@ spec:
 EOF
 ```
 
-### 11a. Wait for DataScienceCluster Ready
+### 10a. Wait for DataScienceCluster Ready
 
 This takes 3-5 minutes as it deploys KServe, Knative Serving, and Istio gateway:
 
@@ -1106,9 +1127,9 @@ done
 
 ---
 
-## Step 12: Final Verification
+## Step 11: Final Verification
 
-### 12a. DataScienceCluster Status
+### 11a. DataScienceCluster Status
 
 ```bash
 oc get datasciencecluster default-dsc -o jsonpath='{.status.phase}'
@@ -1116,7 +1137,7 @@ oc get datasciencecluster default-dsc -o jsonpath='{.status.phase}'
 
 **Expected**: `Ready`
 
-### 12b. Service Mesh / Istio Gateway
+### 11b. Service Mesh / Istio Gateway
 
 Service Mesh 3 runs in `openshift-ingress` (not `istio-system`):
 
@@ -1126,7 +1147,7 @@ oc get pods -n openshift-ingress | grep -E "istiod|gateway"
 
 **Expected**: `istiod-*` and `data-science-gateway-*` pods Running.
 
-### 12c. GatewayClass
+### 11c. GatewayClass
 
 ```bash
 oc get gatewayclass
@@ -1134,7 +1155,7 @@ oc get gatewayclass
 
 **Expected**: `data-science-gateway-class` with status `Accepted: True`.
 
-### 12d. KServe Controller
+### 11d. KServe Controller
 
 ```bash
 oc get pods -n redhat-ods-applications | grep kserve
@@ -1142,20 +1163,24 @@ oc get pods -n redhat-ods-applications | grep kserve
 
 **Expected**: `kserve-controller-manager` pod Running.
 
-### 12e. GPU Resources
+### 11e. GPU Resources on Both Nodes
 
 ```bash
-oc get node ocp-gpu-worker-h100 -o jsonpath='Capacity:    {.status.capacity.nvidia\.com/gpu}{"\n"}Allocatable: {.status.allocatable.nvidia\.com/gpu}{"\n"}'
+for NODE in ocp-gpu-worker-h100 ocp-gpu-worker-h200-0; do
+  echo "=== $NODE ==="
+  oc get node $NODE -o jsonpath='  nvidia.com/gpu:  {.status.allocatable.nvidia\.com/gpu}{"\n"}  rdma/rdma_mlx5:  {.status.allocatable.rdma/rdma_mlx5}{"\n"}'
+  echo ""
+done
 ```
 
-**Expected**:
+**Expected** per node:
 
 ```
-Capacity:    8
-Allocatable: 8
+  nvidia.com/gpu:  8
+  rdma/rdma_mlx5:  1k
 ```
 
-### 12f. All Operator CSVs
+### 11f. All Operator CSVs
 
 OLM copies global-scope CSVs into every namespace, so filter by name to see only the relevant operator per section:
 
@@ -1165,11 +1190,11 @@ echo ""
 echo "--- NFD ---"
 oc get csv -n openshift-nfd --no-headers 2>/dev/null | grep nfd
 echo ""
-echo "--- GPU Operator ---"
-oc get csv -n nvidia-gpu-operator --no-headers 2>/dev/null | grep gpu-operator
-echo ""
 echo "--- Network Operator ---"
 oc get csv -n nvidia-network-operator --no-headers 2>/dev/null | grep nvidia-network
+echo ""
+echo "--- GPU Operator ---"
+oc get csv -n nvidia-gpu-operator --no-headers 2>/dev/null | grep gpu-operator
 echo ""
 echo "--- cert-manager ---"
 oc get csv -n cert-manager-operator --no-headers 2>/dev/null | grep cert-manager
@@ -1186,7 +1211,7 @@ oc get csv -n redhat-ods-operator --no-headers 2>/dev/null | grep rhods
 
 All should show `Succeeded`.
 
-### 12g. GPU Operator Pods
+### 11g. GPU Operator Pods
 
 ```bash
 oc get pods -n nvidia-gpu-operator --no-headers | grep -v Running | grep -v Completed
@@ -1194,7 +1219,7 @@ oc get pods -n nvidia-gpu-operator --no-headers | grep -v Running | grep -v Comp
 
 Should return nothing (all pods Running or Completed).
 
-### 12h. Summary
+### 11h. Summary
 
 ```bash
 echo ""
@@ -1203,12 +1228,15 @@ echo "Phase 5 Complete"
 echo "========================================"
 echo ""
 echo "GPU Resources:"
-oc get node ocp-gpu-worker-h100 -o jsonpath='  nvidia.com/gpu:  {.status.allocatable.nvidia\.com/gpu}{"\n"}  rdma/rdma_mlx5:  {.status.allocatable.rdma/rdma_mlx5}{"\n"}'
+for NODE in ocp-gpu-worker-h100 ocp-gpu-worker-h200-0; do
+  echo "  $NODE:"
+  oc get node $NODE -o jsonpath='    nvidia.com/gpu:  {.status.allocatable.nvidia\.com/gpu}{"\n"}    rdma/rdma_mlx5:  {.status.allocatable.rdma/rdma_mlx5}{"\n"}'
+done
 echo ""
 echo "Operators Installed:"
 echo "  NFD:              $(oc get csv -n openshift-nfd --no-headers 2>/dev/null | grep nfd | awk '{print $1, $NF}')"
-echo "  GPU Operator:     $(oc get csv -n nvidia-gpu-operator --no-headers 2>/dev/null | grep gpu-operator | awk '{print $1, $NF}')"
 echo "  Network Operator: $(oc get csv -n nvidia-network-operator --no-headers 2>/dev/null | grep nvidia-network | awk '{print $1, $NF}')"
+echo "  GPU Operator:     $(oc get csv -n nvidia-gpu-operator --no-headers 2>/dev/null | grep gpu-operator | awk '{print $1, $NF}')"
 echo "  cert-manager:     $(oc get csv -n cert-manager-operator --no-headers 2>/dev/null | grep cert-manager | awk '{print $1, $NF}')"
 echo "  RHCL:             $(oc get csv -n openshift-operators --no-headers 2>/dev/null | grep rhcl | awk '{print $1, $NF}')"
 echo "  LWS:              $(oc get csv -n openshift-lws-operator --no-headers 2>/dev/null | grep leader-worker | awk '{print $1, $NF}')"
@@ -1227,21 +1255,23 @@ echo "========================================"
 
 At the end of Phase 5, you should have:
 
-- [x] **NFD Operator** — GPU node labeled with `feature.node.kubernetes.io/pci-10de.present=true`
-- [x] **NVIDIA GPU Operator** — ClusterPolicy ready, `nvidia.com/gpu: 8` on H100 node
+- [x] **NFD Operator** — Both GPU nodes labeled with `feature.node.kubernetes.io/pci-10de.present=true`
+- [x] **NVIDIA Network Operator** — NicClusterPolicy ready, `rdma/rdma_mlx5: 1k` on both nodes
+- [x] **NVIDIA GPU Operator** — ClusterPolicy ready, `nvidia.com/gpu: 8` on both nodes
 - [x] **cert-manager** — TLS certificate management for RHOAI
 - [x] **RHCL** — API gateway (Authorino, Limitador, DNS sub-operators)
 - [x] **LWS** — Leader-worker set topology for distributed inference
 - [x] **RHOAI** — OpenShift AI platform with Service Mesh 3
 - [x] **DataScienceCluster** — KServe managed, Istio gateway healthy
-- [x] **nvidia-smi** — Shows 8x H100 80GB GPUs
+- [x] **nvidia-smi** — Shows 8x H100 on H100 node, 8x H200 on H200 node
+- [x] **RDMA links** — 8 ACTIVE/LINK_UP per GPU node
 - [x] **All CSVs** — Succeeded
 
 ---
 
 ## Cost
 
-No additional cost from operators — they run on the existing control plane nodes (master nodes have `worker` role). The GPU Operator deploys DaemonSet pods on the H100 worker, but no new instances are created.
+No additional cost from operators — they run on the existing control plane nodes (master nodes have `worker` role). The GPU Operator and Network Operator deploy DaemonSet pods on both GPU workers, but no new instances are created.
 
 ---
 
@@ -1272,12 +1302,22 @@ Common issues:
 oc get pods -n openshift-nfd -l app.kubernetes.io/component=worker -o wide
 ```
 
-Ensure an NFD worker pod is running on the H100 node. Check its logs:
+Ensure NFD worker pods are running on both GPU nodes. Check logs:
 
 ```bash
 NFD_POD=$(oc get pods -n openshift-nfd -l app.kubernetes.io/component=worker --field-selector spec.nodeName=ocp-gpu-worker-h100 -o jsonpath='{.items[0].metadata.name}')
 oc logs -n openshift-nfd $NFD_POD --tail=30
 ```
+
+### NicClusterPolicy Not Ready
+
+Check RDMA shared device plugin pods:
+
+```bash
+oc get pods -n nvidia-network-operator -o wide
+```
+
+If pods are not running on a GPU node, check NFD labels — the device plugin needs `feature.node.kubernetes.io/pci-15b3.present=true` to schedule.
 
 ### RHOAI DSCInitialization Not Created
 
@@ -1305,7 +1345,7 @@ Check for failed conditions. Common issue: Service Mesh not ready. Verify:
 oc get csv -n openshift-operators | grep servicemesh
 ```
 
-If not `Succeeded`, check install plans (Step 9e).
+If not `Succeeded`, check install plans (Step 8e).
 
 ### Sub-Operator Install Plans Stuck
 
@@ -1335,12 +1375,12 @@ done
 
 After Phase 5 completes, the cluster is ready for AI/ML model serving:
 
-1. **Deploy inference models** using KServe `InferenceService` resources
+1. **Deploy inference models** using KServe `InferenceService` or `LLMInferenceService` resources
 2. **Request GPU resources** in pods with `nvidia.com/gpu: N` in resource limits
-3. **(Future)** For multi-node training, return to Part B to install RDMA operators
+3. **Request RDMA resources** in pods with `rdma/rdma_mlx5: 1` for cross-node communication
 
 ---
 
 **Phase 5 Complete!**
 
-**All operators installed. 8x H100 GPUs available. KServe model serving ready. DataScienceCluster in Ready state.**
+**All operators installed. 8x GPUs + RDMA available on both H100 and H200 nodes. KServe model serving ready. DataScienceCluster in Ready state.**
