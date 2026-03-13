@@ -49,6 +49,7 @@ OpenShift 4.19 UPI Cluster
 | **5** | [PHASE5-OPERATORS.md](PHASE5-OPERATORS.md) | 45-60 min | GPU, RDMA, AI platform operators + model serving |
 | **6** | [PHASE6-INFERENCE-SCHEDULING.md](PHASE6-INFERENCE-SCHEDULING.md) | 30-45 min | LLMInferenceService — intelligent inference scheduling |
 | **7** | [PHASE7-TIERED-PREFIX-CACHE.md](PHASE7-TIERED-PREFIX-CACHE.md) | 15-20 min | CPU prefix cache offloading (add-on to Phase 6) |
+| **8** | [PHASE8-PD-DISAGGREGATION.md](PHASE8-PD-DISAGGREGATION.md) | 30-45 min | Prefill/decode disaggregation (H200 prefill, H100 decode) |
 
 **Total Time**: 4.5-6 hours
 
@@ -125,6 +126,7 @@ manual/
 +-- PHASE5-OPERATORS.md                  # GPU, RDMA, AI platform operators
 +-- PHASE6-INFERENCE-SCHEDULING.md       # llm-d intelligent inference scheduling
 +-- PHASE7-TIERED-PREFIX-CACHE.md        # CPU prefix cache offloading
++-- PHASE8-PD-DISAGGREGATION.md         # Prefill/decode disaggregation
 ```
 
 ## Getting Started

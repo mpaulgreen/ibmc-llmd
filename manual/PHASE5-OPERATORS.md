@@ -315,7 +315,7 @@ oc get csv -n nvidia-network-operator
 
 ## Step 3: Create NicClusterPolicy
 
-The NicClusterPolicy tells the Network Operator to deploy the RDMA shared device plugin, which discovers the 8 Mellanox VFs per node and registers them as `rdma/rdma_mlx5` resources:
+The NicClusterPolicy tells the Network Operator to deploy containerized MOFED (for GPUDirect RDMA via `nvidia-peermem`) and the RDMA shared device plugin, which discovers the 8 Mellanox VFs per node and registers them as `rdma/rdma_mlx5` resources:
 
 ```bash
 oc apply -f - <<EOF
@@ -324,6 +324,32 @@ kind: NicClusterPolicy
 metadata:
   name: nic-cluster-policy
 spec:
+  ofedDriver:
+    image: doca-driver
+    repository: nvcr.io/nvidia/mellanox
+    version: doca3.3.0-26.01-1.0.0.0-0
+    env:
+    - name: UNLOAD_STORAGE_MODULES
+      value: "true"
+    startupProbe:
+      initialDelaySeconds: 10
+      periodSeconds: 20
+    livenessProbe:
+      initialDelaySeconds: 30
+      periodSeconds: 30
+    readinessProbe:
+      initialDelaySeconds: 10
+      periodSeconds: 30
+    terminationGracePeriodSeconds: 300
+    upgradePolicy:
+      autoUpgrade: true
+      drain:
+        deleteEmptyDir: true
+        enable: true
+        force: true
+        podSelector: ""
+        timeoutSeconds: 300
+      maxParallelUpgrades: 1
   rdmaSharedDevicePlugin:
     image: k8s-rdma-shared-dev-plugin
     repository: nvcr.io/nvidia/mellanox
@@ -344,6 +370,8 @@ EOF
 ```
 
 > **IBM Cloud specifics**:
+> - `ofedDriver` deploys containerized MOFED on each GPU node — required for GPUDirect RDMA (`nvidia-peermem` module). The GPU Operator's driver pod has a `mofed-validation` init container that waits for MOFED before starting.
+> - `UNLOAD_STORAGE_MODULES=true` — required because NFS storage modules (`rpcrdma`) are loaded and conflict with MOFED's RDMA modules
 > - `deviceIDs: ["101e"]` — ConnectX Family mlx5Gen Virtual Function (how IBM Cloud presents ConnectX-7 NICs to the guest)
 > - `rdmaHcaMax: 1000` — maximum concurrent RDMA contexts per device (shared mode allows multiple pods to use the same RDMA device)
 > - Image repository is `nvcr.io/nvidia/mellanox` (not `nvcr.io/nvidia/cloud-native`)
@@ -364,13 +392,13 @@ while true; do
 done
 ```
 
-Verify the RDMA shared device plugin pods are running on both GPU nodes:
+Verify the MOFED and RDMA shared device plugin pods are running on both GPU nodes:
 
 ```bash
-oc get pods -n nvidia-network-operator -o wide --no-headers | grep rdma
+oc get pods -n nvidia-network-operator -o wide --no-headers
 ```
 
-**Expected**: `rdma-shared-dp-ds-*` pods Running on both `ocp-gpu-worker-h100` and `ocp-gpu-worker-h200-0`.
+**Expected**: `mofed-*` pods 2/2 Running and `rdma-shared-dp-ds-*` pods Running on both `ocp-gpu-worker-h100` and `ocp-gpu-worker-h200-0`.
 
 ### 3b. Verify RDMA Resources on Both Nodes
 
@@ -509,7 +537,7 @@ spec:
     enabled: true
     kernelModuleType: auto
     rdma:
-      enabled: false
+      enabled: true
       useHostMofed: false
   dcgm:
     enabled: true
@@ -540,7 +568,7 @@ spec:
 EOF
 ```
 
-> **Note on `driver.rdma.enabled: false`**: RDMA connectivity between nodes works via the NicClusterPolicy RDMA shared device plugin (Part B) + host kernel RDMA modules (`mlx5_ib`, `ib_core`). Setting `driver.rdma.enabled: true` would enable GPUDirect RDMA (`nvidia-peermem` module) but requires MOFED, which is not installed on RHCOS. The current setup provides regular RDMA — sufficient for P/D disaggregation with NIXL. GPUDirect RDMA can be added later if needed for Wide Expert Parallelism.
+> **Note on `driver.rdma.enabled: true` + `useHostMofed: false`**: This enables GPUDirect RDMA via the `nvidia-peermem` kernel module. With `useHostMofed: false`, the GPU Operator's driver pod includes an `nvidia-peermem-ctr` container that waits for the containerized MOFED (deployed by NicClusterPolicy `ofedDriver` in Part B) before loading the module. This is required for P/D disaggregation with NIXL — UCX `cuda_copy` transport needs `nvidia-peermem` to register GPU memory with RDMA HCAs. Do NOT set `useHostMofed: true` — that's for host-installed MOFED, not containerized MOFED, and causes recursive mount failures.
 
 ### 4f. Wait for ClusterPolicy Ready
 

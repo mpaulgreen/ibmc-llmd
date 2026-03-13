@@ -54,7 +54,9 @@
 
 ### GPU Operator (ClusterPolicy)
 - v25.10 CRD requires `daemonsets`, `dcgm`, `gfd` fields
-- `driver.rdma.enabled: false` unless NVIDIA Network Operator MOFED installed
+- `driver.rdma.enabled: true, useHostMofed: false` — GPUDirect RDMA via containerized MOFED
+- **CRITICAL**: `useHostMofed` MUST be `false` (containerized MOFED via NicClusterPolicy), NOT `true` (host MOFED)
+- `useHostMofed: true` with containerized MOFED causes recursive mounts → crash loop
 - `nvidia-smi` only inside driver container (`-c nvidia-driver-ctr`), NOT via `oc debug node`
 - Stable pod label: `app.kubernetes.io/component=nvidia-driver`
 
@@ -62,7 +64,9 @@
 - Cluster network NICs are VFs (`15b3:101e`), NOT PFs (`15b3:2344`)
 - SR-IOV operator rejects device ID `101e` (not in supported list)
 - Use NVIDIA Network Operator **RDMA shared device plugin** via `NicClusterPolicy` instead
+- `NicClusterPolicy` includes `ofedDriver` (containerized MOFED) + `rdmaSharedDevicePlugin`
 - `NicClusterPolicy` image repo: `nvcr.io/nvidia/mellanox` (not `cloud-native`), version field required
+- `UNLOAD_STORAGE_MODULES=true` in ofedDriver env — required when NFS is in use
 
 ### NVIDIA Network Operator
 - Install via **OLM** (`certified-operators`, package `nvidia-network-operator`), NOT Helm

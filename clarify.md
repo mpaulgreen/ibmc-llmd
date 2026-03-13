@@ -87,3 +87,143 @@ What the manifests configure:
 
   The guide's 32 GPU requirement isn't just a benchmark preference — it's driven by DeepSeek-R1's model size. A smaller MoE model would let you validate the EP pattern on fewer GPUs, but it would be a custom configuration, not the guide as
   written.
+
+
+
+
+
+
+  ------
+
+
+  Config 1: Basic DP+EP with DeepEP High-Throughput
+
+  File: llm-inference-service-dp-ep-deepseek-r1-gpu-deepep-ht.yaml
+
+  - Purpose: Multi-node inference without P/D split — all pods do both prefill and decode
+  - Parallelism: DP=32, DP_LOCAL=8, TP=1, EP=true
+  - Pods: 4 pods (32/8=4), each with 8 GPUs → 32 GPUs total across 4 nodes
+  - All2All backend: deepep_high_throughput
+  - KV transfer: None (no P/D split)
+  - Use case: Maximum throughput for batch workloads
+
+  Config 2: Basic DP+EP Naive
+
+  File: llm-inference-service-dp-ep-deepseek-r1-gpu-naive.yaml
+
+  - Purpose: Same as Config 1 but likely using NCCL-based all-to-all instead of DeepEP
+  - Parallelism: Similar DP+EP setup
+  - Use case: Baseline comparison / compatibility with hardware that doesn't support DeepEP
+
+  Config 3: P/D Disaggregation with DeepEP High-Throughput (both)
+
+  File: llm-inference-service-dp-ep-deepseek-r1-pd-gpu-p-deepep-ht-d-deepep-ht.yaml
+
+  - Purpose: Separate prefill and decode into independent pools
+  - Decode pool (top-level spec): DP=16, DP_LOCAL=8, replicas=1 + worker → 2 pods × 8 GPUs = 16 GPUs
+  - Prefill pool (spec.prefill): DP=16, DP_LOCAL=8, replicas=1 + worker → 2 pods × 8 GPUs = 16 GPUs
+  - Total: 32 GPUs (4 nodes)
+  - All2All backend: deepep_high_throughput for both prefill and decode
+  - KV transfer: NIXL (NixlConnector) transfers KV cache from prefill → decode
+  - EPP: P/D-aware scheduler with pd-profile-handler, prefill-filter, decode-filter
+  - GPU memory: 0.99 (decode), 0.97 (prefill)
+  - Use case: Lower inter-token latency by eliminating prefill interference on decode
+
+  Config 4: P/D Disaggregation with Mixed Backends
+
+  File: llm-inference-service-dp-ep-deepseek-r1-pd-gpu-p-deepep-ht-d-pplx.yaml
+
+  - Purpose: Same P/D split as Config 3 but with different all-to-all backends optimized per role
+  - Decode pool: pplx backend (optimized for low-latency token generation)
+  - Prefill pool: deepep_high_throughput (optimized for batch throughput)
+  - Total: 32 GPUs (4 nodes)
+  - KV transfer: NIXL
+  - Use case: Best of both worlds — high-throughput prefill + low-latency decode
+
+  Summary Table
+
+  ┌──────────────────────┬───────────┬──────────────────────────────┬──────┬───────┬────────────────────────┐
+  │        Config        │ P/D Split │       All2All Backend        │ GPUs │ Nodes │      Key Benefit       │
+  ├──────────────────────┼───────────┼──────────────────────────────┼──────┼───────┼────────────────────────┤
+  │ 1. DP+EP (deepep_ht) │ No        │ deepep_high_throughput       │ 32   │ 4     │ Max throughput         │
+  ├──────────────────────┼───────────┼──────────────────────────────┼──────┼───────┼────────────────────────┤
+  │ 2. DP+EP (naive)     │ No        │ naive/nccl                   │ 32   │ 4     │ Baseline/compatibility │
+  ├──────────────────────┼───────────┼──────────────────────────────┼──────┼───────┼────────────────────────┤
+  │ 3. P/D (ht + ht)     │ Yes       │ deepep_ht (both)             │ 32   │ 4     │ Lower decode latency   │
+  ├──────────────────────┼───────────┼──────────────────────────────┼──────┼───────┼────────────────────────┤
+  │ 4. P/D (ht + pplx)   │ Yes       │ ht (prefill) + pplx (decode) │ 32   │ 4     │ Optimized per role     │
+  └──────────────────────┴───────────┴──────────────────────────────┴──────┴───────┴────────────────────────┘
+
+  All 4 use DeepSeek-R1-0528, EP=true, GPUDirect RDMA via NVSHMEM/IBGDA, and require 32 H200/B200 GPUs across 4 nodes. Configs 3-4 use spec.prefill in the LLMInferenceService CR, confirming that v1alpha1 supports P/D disaggregation natively.
+
+❯ Which configuration are going to use for out purpose? 
+
+⏺ For your setup (1 H100 + 1 H200 = 16 GPUs), none of the 4 configs work as-is (DeepSeek-R1 too large for H100). But we adapt Config 3 (P/D with same backend) pattern — it's the cleanest P/D disaggregation example.
+
+  Our adapted config:
+
+  ┌─────────────────┬──────────────────────────────┬─────────────────────────────────────┐
+  │     Aspect      │     Config 3 (original)      │           Our adaptation            │
+  ├─────────────────┼──────────────────────────────┼─────────────────────────────────────┤
+  │ Model           │ DeepSeek-R1-0528 (671B)      │ Qwen3-32B (32B)                     │
+  ├─────────────────┼──────────────────────────────┼─────────────────────────────────────┤
+  │ Prefill node    │ 2 pods × 8 GPUs (H200)       │ 4 pods × 2 GPUs on H200             │
+  ├─────────────────┼──────────────────────────────┼─────────────────────────────────────┤
+  │ Decode node     │ 2 pods × 8 GPUs (H200)       │ 4 pods × 2 GPUs on H100             │
+  ├─────────────────┼──────────────────────────────┼─────────────────────────────────────┤
+  │ Parallelism     │ DP=16, EP=true, TP=1         │ TP=2, no EP (dense model)           │
+  ├─────────────────┼──────────────────────────────┼─────────────────────────────────────┤
+  │ All2All backend │ deepep_high_throughput       │ Not needed (no EP)                  │
+  ├─────────────────┼──────────────────────────────┼─────────────────────────────────────┤
+  │ KV transfer     │ NIXL (NixlConnector)         │ NIXL (NixlConnector) — same         │
+  ├─────────────────┼──────────────────────────────┼─────────────────────────────────────┤
+  │ RDMA resource   │ rdma/roce_gdr                │ rdma/rdma_mlx5                      │
+  ├─────────────────┼──────────────────────────────┼─────────────────────────────────────┤
+  │ EPP scheduler   │ pd-profile-handler           │ pd-profile-handler — same           │
+  ├─────────────────┼──────────────────────────────┼─────────────────────────────────────┤
+  │ GPUDirect RDMA  │ Yes (NVSHMEM/IBGDA)          │ No (regular RDMA)                   │
+  ├─────────────────┼──────────────────────────────┼─────────────────────────────────────┤
+  │ Total GPUs      │ 32                           │ 16                                  │
+  ├─────────────────┼──────────────────────────────┼─────────────────────────────────────┤
+  │ CRD             │ LLMInferenceService v1alpha1 │ LLMInferenceService v1alpha1 — same │
+  ├─────────────────┼──────────────────────────────┼─────────────────────────────────────┤
+  │ spec.prefill    │ Yes                          │ Yes — same pattern                  │
+  └─────────────────┴──────────────────────────────┴─────────────────────────────────────┘
+
+  What stays the same (proves the concept):
+  - spec.prefill field for separate prefill deployment
+  - NIXL KV cache transfer between prefill and decode
+  - P/D-aware EPP scheduler (pd-profile-handler, prefill-filter, decode-filter)
+  - LLMInferenceService single CR approach
+
+  What changes (hardware adaptation):
+  - Smaller model (fits on H100's 80GB)
+  - TP instead of EP (dense model, not MoE)
+  - No NVSHMEM/DeepEP env vars (no expert parallelism)
+  - Different RDMA resource name for IBM Cloud
+
+
+----
+
+Qwen3-32B is a dense model — every parameter is used for every token. It has one set of weights, and all GPUs process the same computation split via Tensor Parallelism (TP).
+                                                                                                                                  
+  DeepSeek-R1 is a Mixture-of-Experts (MoE) model — it has 256 specialized "expert" sub-networks. For each token, only ~8 experts are activated (out of 256). Expert Parallelism (EP) distributes these 256 experts across GPUs so each GPU only holds
+   a fraction of them. The all2all backend (DeepEP) handles routing tokens to the correct GPU that holds the needed expert.                                                                                                                           
+   
+  ┌─────────────────────────┬───────────────────────────────┬──────────────────────────────────────┐                                                                                                                                                  
+  │                         │    Dense model (Qwen3-32B)    │       MoE model (DeepSeek-R1)        │
+  ├─────────────────────────┼───────────────────────────────┼──────────────────────────────────────┤
+  │ Parameters              │ All used for every token      │ Only ~8/256 experts active per token │
+  ├─────────────────────────┼───────────────────────────────┼──────────────────────────────────────┤
+  │ Parallelism             │ TP — split layers across GPUs │ EP — split experts across GPUs       │
+  ├─────────────────────────┼───────────────────────────────┼──────────────────────────────────────┤
+  │ Cross-GPU communication │ NCCL (tensor shards)          │ All2All (route tokens to experts)    │
+  ├─────────────────────────┼───────────────────────────────┼──────────────────────────────────────┤
+  │ All2All backend needed? │ No                            │ Yes (deepep_ht, pplx, or nccl)       │
+  ├─────────────────────────┼───────────────────────────────┼──────────────────────────────────────┤
+  │ NVSHMEM needed?         │ No                            │ Yes (for DeepEP backends)            │
+  └─────────────────────────┴───────────────────────────────┴──────────────────────────────────────┘
+
+  Since Qwen3-32B has no experts, there's nothing to distribute via EP. We use TP=2 instead — each pair of GPUs splits the model's layers in half.
+
+  The P/D disaggregation (prefill/decode split + NIXL KV transfer) works identically for both dense and MoE models — it's orthogonal to the parallelism strategy.
