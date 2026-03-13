@@ -146,6 +146,8 @@
 | 5 | PHASE5-OPERATORS.md | 45-60 min | GPU, RDMA, AI platform, model serving |
 | 6 | PHASE6-INFERENCE-SCHEDULING.md | 30-45 min | LLMInferenceService (vLLM + EPP + Gateway) |
 | 7 | PHASE7-TIERED-PREFIX-CACHE.md | 15-20 min | CPU prefix cache offloading (add-on) |
+| 8 | PHASE8-PD-DISAGGREGATION.md | 45-60 min | P/D disaggregation (cross-node, NFS RWX) |
+| 9 | PHASE9-WIDE-EP.md | 90-120 min | Wide EP (DeepSeek-V2, NCCL, LWS) |
 
 ## Infrastructure (Pre-existing, kept across deploys)
 - **SSH Key**: r010-3f6ad86f-6044-48fd-9bf4-b9cca40927b8
