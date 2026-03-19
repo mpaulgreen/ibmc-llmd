@@ -1,0 +1,31 @@
+# macOS
+.DS_Store
+
+# Claude Code
+.claude/settings.local.json
+
+# Secrets and credentials (should never be in repo)
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*apikey*
+*pull-secret*
+*kubeconfig
+*kubeadmin-password
+
+# Ignition configs (contain embedded secrets)
+*.ign
+
+# Terraform / IaC state
+*.tfstate
+*.tfstate.backup
+.terraform/
+
+# Editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
