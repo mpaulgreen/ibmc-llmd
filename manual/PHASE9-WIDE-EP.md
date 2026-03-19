@@ -73,9 +73,9 @@ Token arrives at GPU 0 (Node A, H100)
   |
   Expert 3  --> GPU 0 (local, NVLink)     ~900 GB/s
   Expert 47 --> GPU 4 (local, NVLink)     ~900 GB/s
-  Expert 91 --> GPU 11 (remote, NCCL)     ~25-50 Gbps (TCP)  <-- cross-node
+  Expert 91 --> GPU 11 (remote, NCCL)     ~40-80 Gbps (TCP)  <-- cross-node
   Expert 12 --> GPU 1 (local, NVLink)     ~900 GB/s
-  Expert 118--> GPU 13 (remote, NCCL)    ~25-50 Gbps (TCP)  <-- cross-node
+  Expert 118--> GPU 13 (remote, NCCL)    ~40-80 Gbps (TCP)  <-- cross-node
   Expert 55 --> GPU 5 (local, NVLink)     ~900 GB/s
   |
   [All-to-all]: collect results from all experts
@@ -87,7 +87,11 @@ Every forward pass involves all-to-all communication between GPUs. Cross-node tr
 
 ### IBM Cloud VF Limitation: NCCL over TCP
 
-NCCL normally uses IB verbs (RDMA) for cross-node communication (~400 Gbps). On IBM Cloud cluster network VFs (device `101e`), NCCL IB verbs don't work (same VF limitation as UCX RC transport discovered in Phase 8). NCCL falls back to **TCP sockets** (~25-50 Gbps) — functional but 8-16x slower than RDMA.
+IBM Cloud cluster network provides 8 ConnectX-7 VFs (Virtual Functions, device `101e`) per instance — virtual network cards split from the physical NIC (PF, device `15b3:2344`). The hopper-1 RDMA fabric provides **3.2 Tbps bisection bandwidth** (8 links x 400 Gbps), but VFs have restricted IB verbs capabilities.
+
+NCCL's IB plugin discovers the VFs and initializes successfully, but **fails at `ibv_modify_qp`** (QP state transition) when establishing cross-node connections — the VFs cannot complete the INIT→RTR→RTS QP lifecycle needed for RDMA data transfer. This is a different failure mode from Phase 8's UCX RC (which failed on active messages), but the root cause is the same: VFs don't support full IB verbs for remote connections. See **Phase 9B** for the definitive probe results.
+
+NCCL falls back to **TCP sockets** (`NCCL_IB_DISABLE=1`), achieving **~40-80 Gbps** — functional but significantly slower than the ~100 Gbps per-instance RDMA capability.
 
 Additionally, the `deepep_high_throughput` and `deepep_low_latency` all-to-all backends require NVSHMEM with IBGDA transport, which needs true RDMA PFs. On IBM Cloud VFs, we use the `naive` all-to-all backend.
 
@@ -136,7 +140,7 @@ Cross-node communication:
   NCCL all-to-all over TCP/eth0 (NCCL_IB_DISABLE=1)
   Every forward pass: activations sent to expert-holding GPUs
   Intra-node: NVLink (~900 GB/s)
-  Inter-node: TCP sockets (~25-50 Gbps)
+  Inter-node: TCP sockets (~40-80 Gbps)
 ```
 
 **Why no nodeSelector?** Each pod requests `nvidia.com/gpu: 8` and each node has exactly 8 GPUs. Kubernetes can only fit one pod per GPU node — the scheduler automatically places the second pod on the other node. No anti-affinity or nodeSelector needed.
@@ -613,8 +617,10 @@ This single CR creates the entire Wide EP stack: LWS with size=2, vLLM with EP=1
 > - `parallelism.expert: true` — enables `--enable-expert-parallel` in vLLM
 > - `parallelism.tensor: 1` — no TP; EP handles distribution; preserves MLA KV cache efficiency
 > - `worker` section — defines the worker pod template (non-leader pods in the LWS group)
-> - `NCCL_IB_DISABLE=1` — forces TCP sockets (IB verbs don't work on IBM Cloud VFs)
+> - `NCCL_IB_DISABLE=1` — forces TCP sockets (VFs fail `ibv_modify_qp` for cross-node QPs — see Phase 9B)
 > - `VLLM_ALL2ALL_BACKEND=naive` — naive all-to-all (deepep backends need NVSHMEM/IBGDA)
+> - `initContainers` — patches hardcoded 10-min ZMQ timeout in vLLM `core_client.py` to 4 hours (no env var controls it)
+> - `livenessProbe.initialDelaySeconds: 10800` — 3-hour grace for ~131-min NFS cold load
 > - No `--kv-transfer-config` — EP does not use NIXL; NCCL handles all communication
 > - No `UCX_TLS` — UCX/NIXL is not involved in EP communication
 
@@ -641,6 +647,19 @@ spec:
     tensor: 1
   template:
     serviceAccountName: wide-ep-sa
+    initContainers:
+    - name: patch-vllm-timeout
+      image: registry.redhat.io/rhaiis/vllm-cuda-rhel9:latest
+      command: ["/bin/bash", "-c"]
+      args:
+      - |
+        SRC=/opt/app-root/lib64/python3.12/site-packages/vllm/v1/engine/core_client.py
+        cp "$SRC" /patch/core_client.py
+        sed -i 's/timeout=600_000/timeout=14400_000/g' /patch/core_client.py
+        echo "Patched $(grep -c 'timeout=14400_000' /patch/core_client.py) occurrence(s) of timeout=600_000 -> timeout=14400_000"
+      volumeMounts:
+      - name: vllm-patch
+        mountPath: /patch
     containers:
     - name: main
       securityContext:
@@ -654,7 +673,7 @@ spec:
           secretKeyRef:
             name: deepseek-hf-token
             key: HF_TOKEN
-      # ----- NCCL: force TCP (IBM Cloud VFs don't support IB verbs) -----
+      # ----- NCCL: force TCP (VFs fail ibv_modify_qp for cross-node QPs — see Phase 9B) -----
       - name: NCCL_IB_DISABLE
         value: "1"
       - name: NCCL_SOCKET_IFNAME
@@ -681,12 +700,15 @@ spec:
       volumeMounts:
       - name: shm
         mountPath: /dev/shm
+      - name: vllm-patch
+        mountPath: /opt/app-root/lib64/python3.12/site-packages/vllm/v1/engine/core_client.py
+        subPath: core_client.py
       livenessProbe:
         httpGet:
           path: /health
           port: 8000
           scheme: HTTPS
-        initialDelaySeconds: 3600
+        initialDelaySeconds: 10800
         periodSeconds: 10
         timeoutSeconds: 10
         failureThreshold: 3
@@ -695,12 +717,27 @@ spec:
       emptyDir:
         medium: Memory
         sizeLimit: 32Gi
+    - name: vllm-patch
+      emptyDir: {}
 
   # ==========================================
   # WORKER pod template (headless, EP ranks 8-15)
   # ==========================================
   worker:
     serviceAccountName: wide-ep-sa
+    initContainers:
+    - name: patch-vllm-timeout
+      image: registry.redhat.io/rhaiis/vllm-cuda-rhel9:latest
+      command: ["/bin/bash", "-c"]
+      args:
+      - |
+        SRC=/opt/app-root/lib64/python3.12/site-packages/vllm/v1/engine/core_client.py
+        cp "$SRC" /patch/core_client.py
+        sed -i 's/timeout=600_000/timeout=14400_000/g' /patch/core_client.py
+        echo "Patched $(grep -c 'timeout=14400_000' /patch/core_client.py) occurrence(s) of timeout=600_000 -> timeout=14400_000"
+      volumeMounts:
+      - name: vllm-patch
+        mountPath: /patch
     containers:
     - name: main
       securityContext:
@@ -714,7 +751,7 @@ spec:
           secretKeyRef:
             name: deepseek-hf-token
             key: HF_TOKEN
-      # ----- NCCL: force TCP -----
+      # ----- NCCL: force TCP (VFs fail ibv_modify_qp — see Phase 9B) -----
       - name: NCCL_IB_DISABLE
         value: "1"
       - name: NCCL_SOCKET_IFNAME
@@ -741,20 +778,19 @@ spec:
       volumeMounts:
       - name: shm
         mountPath: /dev/shm
-      livenessProbe:
-        httpGet:
-          path: /health
-          port: 8000
-          scheme: HTTPS
-        initialDelaySeconds: 3600
-        periodSeconds: 10
-        timeoutSeconds: 10
-        failureThreshold: 3
+      - name: vllm-patch
+        mountPath: /opt/app-root/lib64/python3.12/site-packages/vllm/v1/engine/core_client.py
+        subPath: core_client.py
+      # NOTE: No livenessProbe on worker — it is a headless NCCL peer with no HTTP
+      # API server on port 8000. A liveness probe here kills the worker after
+      # initialDelaySeconds expires, triggering LWS cascade restart of the group.
     volumes:
     - name: shm
       emptyDir:
         medium: Memory
         sizeLimit: 32Gi
+    - name: vllm-patch
+      emptyDir: {}
 
   # ==========================================
   # ROUTER (EPP scheduler)
@@ -783,22 +819,27 @@ EOF
 | `--gpu-memory-utilization 0.90` | Conservative for H100 80GB (leaves headroom for NCCL buffers) |
 | `--max-model-len 8192` | Conservative context length for initial validation |
 | `--enforce-eager` | Skips CUDA graph compilation — faster startup on NFS |
-| `livenessProbe.initialDelaySeconds: 3600` | 60 min grace: 472GB NFS load is much slower than 65GB |
+| `initContainers: patch-vllm-timeout` | Patches hardcoded 600s (10 min) ZMQ poll in `core_client.py` to 14400s (4 hr). The API server process crashes with `TimeoutError: Timed out waiting for engines` if model loading exceeds 10 min. No env var controls this — it's a literal `timeout=600_000` in the vLLM source |
+| `vllm-patch` volume + subPath mount | Overlays the patched `core_client.py` onto the original in the main container without modifying the controller-generated startup command |
+| `livenessProbe.initialDelaySeconds: 10800` | Leader only: 3 hour grace for ~170 min total startup (130 min NFS load + 22 min memory profiling + 16 min FlashInfer autotuning). Previous 60 min caused pod kills mid-load |
+| Worker: no livenessProbe | Worker pods are headless NCCL peers — no HTTP API on port 8000. A liveness probe kills the worker when `initialDelaySeconds` expires, triggering LWS cascade restart |
 | `router.scheduler: {}` | Default scheduler (load-aware, no P/D split) |
 
 > **Note on `--gpu-memory-utilization 0.90`**: With mixed H100 (80GB) and H200 (141GB), the H100 is the bottleneck. Setting 0.90 x 80GB = 72GB available per GPU — sufficient for DeepSeek-V2's ~29.5GB weights/GPU + KV cache + NCCL buffers.
 
-> **Note on `livenessProbe.initialDelaySeconds: 3600`**: DeepSeek-V2 has many more weight shards than Qwen3-32B. At ~130s/shard cold cache, loading 472GB from NFS could take 45-60 minutes. The 60-minute liveness probe grace period prevents Kubernetes from killing pods during initial model loading.
+> **Note on `livenessProbe.initialDelaySeconds: 10800`**: DeepSeek-V2 has 55 weight shards totaling ~472GB. At ~143s/shard from NFS cold cache, model loading takes ~131 minutes. The 3-hour (180 min) liveness probe grace period gives a 50-minute buffer. The previous 60-minute setting caused pod kills at 60 min, triggering LWS cascade restarts that reset loading from 0%.
+>
+> **Note on `initContainers: patch-vllm-timeout`**: The vLLM API server has a **hardcoded 600-second (10 min) ZMQ poll** in `core_client.py` (lines 530, 1342) that crashes with `TimeoutError: Timed out waiting for engines to send initial message on input socket` if model loading exceeds 10 minutes. No env var controls this timeout — `VLLM_RPC_TIMEOUT` is defined in `envs.py` but never referenced in the codebase, and `VLLM_ENGINE_ITERATION_TIMEOUT_S` controls a different timeout (engine iteration, not startup). The initContainer copies `core_client.py` to an emptyDir volume and patches `timeout=600_000` → `timeout=14400_000` (2 hours). The main container then mounts the patched file over the original via `subPath`.
 
 ---
 
 ## Step 5b: Grant SCC to Controller-Created SA
 
-The LLMInferenceService controller auto-creates a service account named `deepseek-v2-ep-kserve`. Wait for it, then grant the multi-node SCC:
+The LLMInferenceService controller auto-creates a service account for the multi-node LWS pods. The SA name follows the pattern `<name>-kserve-mn`. Wait for it, then grant the multi-node SCC:
 
 ```bash
 echo "Waiting for controller to create SA..."
-while ! oc get sa deepseek-v2-ep-kserve -n ${NAMESPACE} &>/dev/null; do
+while ! oc get sa deepseek-v2-ep-kserve-mn -n ${NAMESPACE} &>/dev/null; do
   echo -n "."
   sleep 5
 done
@@ -806,20 +847,20 @@ echo ""
 echo "SA created. Granting SCC..."
 
 oc adm policy add-scc-to-user openshift-ai-llminferenceservice-multi-node-scc \
-  -z deepseek-v2-ep-kserve -n ${NAMESPACE}
+  -z deepseek-v2-ep-kserve-mn -n ${NAMESPACE}
 ```
 
-> **Why two SAs?** Same pattern as Phase 8: `wide-ep-sa` is used by the worker template, `deepseek-v2-ep-kserve` is auto-created by the controller for the leader/decode template. Both need the SCC for GPU memory pinning.
+> **Why two SAs?** Same pattern as Phase 8: `wide-ep-sa` is used by the worker template, `deepseek-v2-ep-kserve-mn` is auto-created by the controller for the leader/decode template. Both need the SCC for GPU memory pinning.
 
 ---
 
 ## Step 6: Wait for Model Loading and Pods Ready
 
-DeepSeek-V2 is ~472GB — NFS cold load will take 30-60 minutes per pod.
+DeepSeek-V2 is ~472GB — total startup takes ~170 minutes (130 min NFS load + 22 min memory profiling + 16 min FlashInfer autotuning + 2 min final init).
 
 ```bash
 echo "Waiting for LLMInferenceService to become Ready..."
-echo "(DeepSeek-V2 is 472GB -- NFS cold load takes 30-60 min per pod)"
+echo "(DeepSeek-V2 is 472GB -- total startup ~170 min from NFS cold cache)"
 while true; do
   READY=$(oc get llmisvc deepseek-v2-ep -n ${NAMESPACE} -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
   if [ "$READY" = "True" ]; then
@@ -1003,11 +1044,11 @@ for c in json.load(sys.stdin).get("status",{}).get("conditions",[]):
 ```
 HTTPRoutesReady: True
 InferencePoolReady: True
-MainWorkloadReady: True
 PresetsCombined: True
 Ready: True
 RouterReady: True
 SchedulerWorkloadReady: True
+WorkerWorkloadReady: True
 WorkloadsReady: True
 ```
 
@@ -1061,12 +1102,14 @@ curl -s http://${GATEWAY_IP}/${NAMESPACE}/${LLMISVC_NAME}/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d "{
     \"model\": \"${MODEL_NAME}\",
-    \"messages\": [{\"role\": \"user\", \"content\": \"What is expert parallelism? Answer in 2 sentences.\"}],
-    \"max_tokens\": 100
+    \"messages\": [{\"role\": \"user\", \"content\": \"What is expert parallelism? One sentence.\"}],
+    \"max_tokens\": 15
   }" | python3 -m json.tool
 ```
 
 **Expected**: HTTP 200 with a valid response in `choices[0].message.content`.
+
+> **IBM Cloud LB idle timeout (50s)**: The VPC load balancer drops connections if no data is sent for ~50 seconds. With Wide EP over TCP, generation speed is ~1.5s/token. Non-streaming requests with `max_tokens` > ~30 will hit this timeout and return "Empty reply from server" (curl error 52). Use `"stream": true` for longer responses, or keep `max_tokens` under 30 for non-streaming tests.
 
 **If you get a 404**, the HTTPRoute path doesn't match. Check Step 10a and adjust the curl path.
 
@@ -1076,22 +1119,25 @@ curl -s http://${GATEWAY_IP}/${NAMESPACE}/${LLMISVC_NAME}/v1/chat/completions \
 oc logs -n ${NAMESPACE} $(oc get pods -n ${NAMESPACE} --no-headers | grep scheduler | awk '{print $1}') --tail=20
 ```
 
-### 11b. Send a Longer Request
+### 11b. Send a Longer Request (Streaming)
 
-A longer prompt exercises more expert routing:
+A longer prompt exercises more expert routing. Use `stream: true` to avoid the IBM Cloud LB 50s idle timeout:
 
 ```bash
-curl -s http://${GATEWAY_IP}/${NAMESPACE}/${LLMISVC_NAME}/v1/chat/completions \
+curl -s --max-time 300 http://${GATEWAY_IP}/${NAMESPACE}/${LLMISVC_NAME}/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d "{
     \"model\": \"${MODEL_NAME}\",
     \"messages\": [
       {\"role\": \"system\", \"content\": \"You are a helpful AI assistant that explains distributed computing concepts clearly.\"},
-      {\"role\": \"user\", \"content\": \"Explain how Mixture of Experts models work, including the gating mechanism, expert selection, and why MoE is more efficient than dense models. Compare DeepSeek-V2's MoE architecture to standard MoE.\"}
+      {\"role\": \"user\", \"content\": \"Explain how Mixture of Experts models work and why MoE is efficient. 3 sentences.\"}
     ],
-    \"max_tokens\": 300
-  }" | python3 -m json.tool
+    \"max_tokens\": 100,
+    \"stream\": true
+  }"
 ```
+
+**Expected**: SSE stream of `data:` lines ending with `data: [DONE]`. At ~1.5s/token, 100 tokens takes ~150s.
 
 ### 11c. Verify Throughput Metrics
 
@@ -1270,7 +1316,7 @@ At the end of Phase 9, you should have:
 
 ## Known Limitations
 
-1. **NCCL over TCP**: IBM Cloud VFs (101e) don't support NCCL IB verbs. NCCL falls back to TCP sockets (~25-50 Gbps vs ~400 Gbps RDMA). Since EP's all-to-all runs on every forward pass, TCP is the dominant bottleneck. Expect significantly lower throughput than RDMA-native deployments.
+1. **NCCL over TCP**: IBM Cloud VFs (`101e`) fail at `ibv_modify_qp` when establishing cross-node RDMA connections (see Phase 9B for definitive probe). NCCL uses TCP sockets (~40-80 Gbps vs ~100 Gbps per-instance RDMA capability). Since EP's all-to-all runs on every forward pass, TCP is the dominant bottleneck. Expect significantly lower throughput than RDMA-native deployments.
 
 2. **No P/D + Wide EP**: Combining P/D disaggregation with Wide EP requires 32 GPUs (16 prefill + 16 decode). This deployment has 16 GPUs total — we run EP without P/D split.
 
@@ -1278,7 +1324,9 @@ At the end of Phase 9, you should have:
 
 4. **Naive all-to-all backend**: The `deepep_high_throughput` and `deepep_low_latency` backends require NVSHMEM with IBGDA transport, which needs true RDMA PFs — not available on IBM Cloud VFs.
 
-5. **Model loading time**: 472GB over NFS is slow — 30-60 min cold cache. Subsequent restarts are faster with page cache.
+5. **Model loading time**: 472GB over NFS takes ~170 min total (130 min shard loading + 22 min memory profiling + 16 min FlashInfer autotuning). NFS page cache does NOT survive pod restarts on different nodes.
+
+6. **IBM Cloud LB idle timeout (50s)**: The VPC load balancer drops connections after ~50s of no data. At ~1.5s/token, non-streaming requests are limited to ~30 tokens. Use `"stream": true` for longer responses.
 
 ---
 
@@ -1382,16 +1430,17 @@ Verify both SAs have the SCC:
 oc adm policy who-can use scc openshift-ai-llminferenceservice-multi-node-scc 2>/dev/null | grep -A5 "ServiceAccounts"
 ```
 
-Both `wide-ep-sa` and `deepseek-v2-ep-kserve` should be listed.
+Both `wide-ep-sa` and `deepseek-v2-ep-kserve-mn` should be listed.
 
 ---
 
 ## Next Steps
 
-1. **Compare with single-node EP**: Deploy DeepSeek-V2 on a single 8-GPU node with EP=8 to measure the TCP overhead of wide EP
-2. **Benchmark**: Use [inference-perf](https://github.com/kubernetes-sigs/inference-perf) to measure tokens/s with wide EP vs single-node
-3. **Production RDMA**: On bare-metal or cloud with PF-based RDMA, re-enable `NCCL_IB_DISABLE=0` and switch to `deepep_high_throughput` backend for ~16x faster cross-node communication
-4. **Scale up**: With 32+ GPUs, combine Wide EP (Phase 9) with P/D disaggregation (Phase 8) for the reference architecture pattern
+1. **Phase 9B (completed)**: NCCL RoCE probe confirmed VFs cannot support RDMA — `ibv_modify_qp` fails. TCP is the only viable transport.
+2. **Compare with single-node EP**: Deploy DeepSeek-V2 on a single 8-GPU node with EP=8 to measure the TCP overhead of wide EP
+3. **Benchmark**: Use [inference-perf](https://github.com/kubernetes-sigs/inference-perf) to measure tokens/s with wide EP vs single-node
+4. **Production RDMA**: On bare-metal or cloud with PF-based RDMA (not VFs), re-enable `NCCL_IB_DISABLE=0` and switch to `deepep_high_throughput` backend
+5. **Scale up**: With 32+ GPUs, combine Wide EP (Phase 9) with P/D disaggregation (Phase 8) for the reference architecture pattern
 
 ---
 
